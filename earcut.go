@@ -37,7 +37,7 @@ func Triangulate[T float](polygon []Point[T], holes [][]Point[T]) ([]Point[T], [
 		Expected: len(points) + 2*len(holes),
 	}
 
-	// create a linked Node list
+	// create a linked node list
 	outer := linkedList(alloc, polygon, true, 0)
 
 	if outer == nil || outer.Next == outer.Prev {
@@ -87,7 +87,7 @@ func calculateInvSize[T float](points []Point[T]) invSize[T] {
 	return invSize
 }
 
-func earcutLinked[T float](alloc *nodeAllocator[T], ear *Node[T], triangles []uint32, invSize invSize[T], pass int) []uint32 {
+func earcutLinked[T float](alloc *nodeAllocator[T], ear *node[T], triangles []uint32, invSize invSize[T], pass int) []uint32 {
 	if ear == nil {
 		return triangles
 	}
@@ -145,7 +145,7 @@ func earcutLinked[T float](alloc *nodeAllocator[T], ear *Node[T], triangles []ui
 	return triangles
 }
 
-func indexCurve[T float](start *Node[T], invSize invSize[T]) {
+func indexCurve[T float](start *node[T], invSize invSize[T]) {
 	p := start
 
 	for {
@@ -192,11 +192,11 @@ func zOrder[T float](point Point[T], invSize invSize[T]) uint64 {
 
 // Simon Tatham's linked list merge sort algorithm
 // http://www.chiark.greenend.org.uk/~sgtatham/algorithms/listsort.html
-func sortLinked[T float](list *Node[T]) *Node[T] {
+func sortLinked[T float](list *node[T]) *node[T] {
 	inSize := 1
 
 	for {
-		var e, tail *Node[T]
+		var e, tail *node[T]
 		var numMerges int
 
 		p := list
@@ -259,7 +259,7 @@ func sortLinked[T float](list *Node[T]) *Node[T] {
 }
 
 // check whether a polygon node forms a valid ear with adjacent nodes
-func isEar[T float](ear *Node[T]) bool {
+func isEar[T float](ear *node[T]) bool {
 	a := ear.Prev
 	b := ear
 	c := ear.Next
@@ -292,7 +292,7 @@ func isEar[T float](ear *Node[T]) bool {
 	return true
 }
 
-func isEarHashed[T float](ear *Node[T], invSize invSize[T]) bool {
+func isEarHashed[T float](ear *node[T], invSize invSize[T]) bool {
 	a := ear.Prev
 	b := ear
 	c := ear.Next
@@ -379,7 +379,7 @@ func isEarHashed[T float](ear *Node[T], invSize invSize[T]) bool {
 	return true
 }
 
-func cureLocalIntersections[T float](start *Node[T], triangles []uint32) (*Node[T], []uint32) {
+func cureLocalIntersections[T float](start *node[T], triangles []uint32) (*node[T], []uint32) {
 	p := start
 
 	for {
@@ -453,7 +453,7 @@ func sign[T float](value T) int {
 }
 
 // try splitting polygon into two and triangulate them independently
-func splitEarcut[T float](alloc *nodeAllocator[T], start *Node[T], triangles []uint32, invSize invSize[T]) []uint32 {
+func splitEarcut[T float](alloc *nodeAllocator[T], start *node[T], triangles []uint32, invSize invSize[T]) []uint32 {
 	// look for a valid diagonal that divides the polygon into two
 	a := start
 
@@ -486,7 +486,7 @@ func splitEarcut[T float](alloc *nodeAllocator[T], start *Node[T], triangles []u
 	}
 }
 
-func isValidDiagonal[T float](a, b *Node[T]) bool {
+func isValidDiagonal[T float](a, b *node[T]) bool {
 	return a.Next.Index != b.Index && a.Prev.Index != b.Index && !intersectsPolygon(a, b) && // doesn't intersect other edges
 		(locallyInside(a, b) && locallyInside(b, a) && middleInside(a, b) && // locally visible
 			(area(a.Prev.Point, a.Point, b.Prev.Point) != 0 || area(a.Point, b.Prev.Point, b.Point) != 0) || // does not create opposite-facing sectors
@@ -494,7 +494,7 @@ func isValidDiagonal[T float](a, b *Node[T]) bool {
 }
 
 // check if the middle point of a polygon diagonal is inside the polygon
-func middleInside[T float](a, b *Node[T]) bool {
+func middleInside[T float](a, b *node[T]) bool {
 	p := a
 	var inside bool
 
@@ -520,7 +520,7 @@ func middleInside[T float](a, b *Node[T]) bool {
 }
 
 // check if a polygon diagonal intersects any polygon segments
-func intersectsPolygon[T float](a, b *Node[T]) bool {
+func intersectsPolygon[T float](a, b *node[T]) bool {
 	p := a
 
 	for {
@@ -541,8 +541,8 @@ func intersectsPolygon[T float](a, b *Node[T]) bool {
 	}
 }
 
-func eliminateHoles[T float](alloc *nodeAllocator[T], outer *Node[T], holes [][]Point[T], indexOffset uint32) *Node[T] {
-	queue := make([]*Node[T], 0, len(holes))
+func eliminateHoles[T float](alloc *nodeAllocator[T], outer *node[T], holes [][]Point[T], indexOffset uint32) *node[T] {
+	queue := make([]*node[T], 0, len(holes))
 
 	for _, hole := range holes {
 		list := linkedList(alloc, hole, false, indexOffset)
@@ -554,7 +554,7 @@ func eliminateHoles[T float](alloc *nodeAllocator[T], outer *Node[T], holes [][]
 		indexOffset += uint32(len(hole))
 	}
 
-	slices.SortStableFunc(queue, func(a, b *Node[T]) int {
+	slices.SortStableFunc(queue, func(a, b *node[T]) int {
 		return sign(compareXYSlope(a, b))
 	})
 
@@ -566,7 +566,7 @@ func eliminateHoles[T float](alloc *nodeAllocator[T], outer *Node[T], holes [][]
 	return outer
 }
 
-func eliminateHole[T float](alloc *nodeAllocator[T], hole, outer *Node[T]) *Node[T] {
+func eliminateHole[T float](alloc *nodeAllocator[T], hole, outer *node[T]) *node[T] {
 	bridge := findHoleBridge(hole, outer)
 	if bridge == nil {
 		return outer
@@ -581,7 +581,7 @@ func eliminateHole[T float](alloc *nodeAllocator[T], hole, outer *Node[T]) *Node
 }
 
 // eliminate co-linear or duplicate points
-func filterPoints[T float](start, end *Node[T]) *Node[T] {
+func filterPoints[T float](start, end *node[T]) *node[T] {
 	if start == nil {
 		return nil
 	}
@@ -616,12 +616,12 @@ func filterPoints[T float](start, end *Node[T]) *Node[T] {
 	return end
 }
 
-func findHoleBridge[T float](hole, outer *Node[T]) *Node[T] {
+func findHoleBridge[T float](hole, outer *node[T]) *node[T] {
 	p := outer
 	hx, hy := hole.X, hole.Y
 	qx := T(math.Inf(-1))
 
-	var m *Node[T]
+	var m *node[T]
 
 	// find a segment intersected by a ray from the hole's leftmost point to the left;
 	// segment's endpoint with lesser x will be potential connection point
@@ -722,7 +722,7 @@ func area[T float](p, q, r Point[T]) T {
 }
 
 // check if a polygon diagonal is locally inside the polygon
-func locallyInside[T float](a, b *Node[T]) bool {
+func locallyInside[T float](a, b *node[T]) bool {
 	v := area(a.Prev.Point, a.Point, a.Next.Point)
 	if v < 0 {
 		return area(a.Point, b.Point, a.Next.Point) >= 0 &&
@@ -734,12 +734,12 @@ func locallyInside[T float](a, b *Node[T]) bool {
 }
 
 // whether sector in vertex m contains sector in vertex p in the same coordinates
-func sectorContainsSector[T float](m, p *Node[T]) bool {
+func sectorContainsSector[T float](m, p *node[T]) bool {
 	return area(m.Prev.Point, m.Point, p.Prev.Point) < 0 &&
 		area(p.Next.Point, m.Point, m.Next.Point) < 0
 }
 
-func compareXYSlope[T float](a, b *Node[T]) T {
+func compareXYSlope[T float](a, b *node[T]) T {
 	result := a.X - b.X
 
 	// when the left-most point of 2 holes meet at a vertex, sort the holes counterclockwise so that when we find
@@ -771,7 +771,7 @@ func signedArea[T float](points []Point[T]) T {
 }
 
 // find the leftmost node of a polygon ring
-func getLeftmost[T float](start *Node[T]) *Node[T] {
+func getLeftmost[T float](start *node[T]) *node[T] {
 	p := start
 	leftmost := start
 
@@ -788,30 +788,30 @@ func getLeftmost[T float](start *Node[T]) *Node[T] {
 	}
 }
 
-type Node[T float] struct {
+type node[T float] struct {
 	Point[T]
-	Prev, Next   *Node[T]
-	PrevZ, NextZ *Node[T]
+	Prev, Next   *node[T]
+	PrevZ, NextZ *node[T]
 
 	Z       uint64
 	Index   uint32
 	Steiner bool
 }
 
-func (n *Node[T]) String() string {
+func (n *node[T]) String() string {
 	return strconv.Itoa(int(n.Index))
 }
 
-func (n *Node[T]) EqualTo(other *Node[T]) bool {
+func (n *node[T]) EqualTo(other *node[T]) bool {
 	return n.Point == other.Point
 }
 
 type nodeAllocator[T float] struct {
 	Expected int
-	buf      []Node[T]
+	buf      []node[T]
 }
 
-func (a *nodeAllocator[T]) Alloc() *Node[T] {
+func (a *nodeAllocator[T]) Alloc() *node[T] {
 	if len(a.buf) == 0 {
 		count := a.Expected
 
@@ -821,7 +821,7 @@ func (a *nodeAllocator[T]) Alloc() *Node[T] {
 			count = 1024
 		}
 
-		a.buf = make([]Node[T], count)
+		a.buf = make([]node[T], count)
 	}
 
 	node := &a.buf[0]
@@ -830,7 +830,7 @@ func (a *nodeAllocator[T]) Alloc() *Node[T] {
 	return node
 }
 
-func createNode[T float, I uint32 | int](a *nodeAllocator[T], idx I, point Point[T]) *Node[T] {
+func createNode[T float, I uint32 | int](a *nodeAllocator[T], idx I, point Point[T]) *node[T] {
 	node := a.Alloc()
 
 	node.Point = point
@@ -839,7 +839,7 @@ func createNode[T float, I uint32 | int](a *nodeAllocator[T], idx I, point Point
 	return node
 }
 
-func insertNode[T float, I uint32 | int](a *nodeAllocator[T], idx I, point Point[T], last *Node[T]) *Node[T] {
+func insertNode[T float, I uint32 | int](a *nodeAllocator[T], idx I, point Point[T], last *node[T]) *node[T] {
 	p := createNode(a, idx, point)
 	if last == nil {
 		p.Prev = p
@@ -854,7 +854,7 @@ func insertNode[T float, I uint32 | int](a *nodeAllocator[T], idx I, point Point
 	return p
 }
 
-func removeNode[T float](p *Node[T]) {
+func removeNode[T float](p *node[T]) {
 	p.Next.Prev = p.Prev
 	p.Prev.Next = p.Next
 
@@ -869,7 +869,7 @@ func removeNode[T float](p *Node[T]) {
 
 // link two polygon vertices with a bridge; if the vertices belong to the same ring, it splits polygon into two;
 // if one belongs to the outer ring and another to a hole, it merges it into a single ring
-func splitPolygon[T float](alloc *nodeAllocator[T], a, b *Node[T]) *Node[T] {
+func splitPolygon[T float](alloc *nodeAllocator[T], a, b *node[T]) *node[T] {
 
 	a2 := createNode(alloc, a.Index, a.Point)
 	b2 := createNode(alloc, b.Index, b.Point)
@@ -892,8 +892,8 @@ func splitPolygon[T float](alloc *nodeAllocator[T], a, b *Node[T]) *Node[T] {
 	return b2
 }
 
-func linkedList[T float](alloc *nodeAllocator[T], points []Point[T], clockwise bool, indexOffset uint32) *Node[T] {
-	var last *Node[T]
+func linkedList[T float](alloc *nodeAllocator[T], points []Point[T], clockwise bool, indexOffset uint32) *node[T] {
+	var last *node[T]
 
 	isClockwise := signedArea(points) > 0
 
