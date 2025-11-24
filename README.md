@@ -16,12 +16,14 @@ Signature:
 func Triangulate[T float](polygon []Point[T], holes [][]Point[T]) ([]Point[T], []uint32)
 ```
 
+You can use Triangulate with either `float32` or `float64`.
+
 For algorithm details, edge cases, and general behaviour, refer to the original
 [README](https://github.com/mapbox/earcut/blob/c00ba4e1e724cab5e611d136eef9d3f43e2f3386/README.md).
 
 ## Usage
 
-```
+```go
 import "github.com/oliverbestmann/earcut-go"
 
 points := []earcut.Point{ /* ... */ }
