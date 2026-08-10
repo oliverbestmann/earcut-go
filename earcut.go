@@ -1,3 +1,7 @@
+// Package earcut implements polygon triangulation using a modified
+// ear-clipping algorithm optimized with Z-order curve hashing.
+// It supports holes, self-intersections, and degenerate inputs,
+// and is a Go port of mapbox/earcut.
 package earcut
 
 import (
@@ -6,14 +10,24 @@ import (
 	"strconv"
 )
 
-type float interface {
-	~float32 | ~float64
-}
-
+// Point is a 2D point with X and Y coordinates.
 type Point[T float] struct {
 	X, Y T
 }
 
+type float interface {
+	float32 | float64
+}
+
+// Triangulate triangulates a polygon with possible holes using the earcut algorithm.
+//
+// The polygon parameter defines the outer boundary; each element of holes
+// defines an inner boundary (a hole) within the polygon.
+//
+// It returns the points actually used in the triangulation and a flat slice
+// of indices. Every three consecutive indices form one triangle: indices[i],
+// indices[i+1], indices[i+2]. The returned point slice may contain Steiner
+// points inserted during hole elimination or processing.
 func Triangulate[T float](polygon []Point[T], holes [][]Point[T]) ([]Point[T], []uint32) {
 	// count the number of points
 	pointCount := len(polygon)
@@ -806,6 +820,7 @@ func (n *node[T]) EqualTo(other *node[T]) bool {
 	return n.Point == other.Point
 }
 
+// nodeAllocator is an internal helper for efficient node allocation.
 type nodeAllocator[T float] struct {
 	Expected int
 	buf      []node[T]
