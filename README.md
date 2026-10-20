@@ -26,7 +26,8 @@ points, indices := earcut.Triangulate(polygon, nil)
 ```
 
 `Triangulate` takes the outer ring and a list of holes. It works with `float32` and `float64` points. It returns the
-outer ring and the holes concatenated into one slice, and a flat slice of indices into that slice. Every three indices
+outer ring and the holes concatenated into one slice, and a flat slice of indices into that slice. Without holes, the
+returned points are the polygon slice itself, not a copy. Every three indices
 form one triangle. A hole with a single point is a Steiner point: it is not cut out, but becomes a vertex of the
 triangulation. The winding order of the input does not matter.
 

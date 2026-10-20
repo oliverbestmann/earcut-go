@@ -24,7 +24,8 @@ type float interface {
 // defines an inner boundary (a hole) within the polygon.
 //
 // It returns the outer ring and all holes concatenated into one slice, and a
-// flat slice of indices into it. Every three consecutive indices form one
+// flat slice of indices into it. Without holes, the returned points are the polygon
+// slice itself, not a copy. Every three consecutive indices form one
 // triangle: indices[i], indices[i+1], indices[i+2]. A hole with a single point
 // is a Steiner point: it is not cut out, but used as a triangle vertex.
 // Empty holes are ignored.
