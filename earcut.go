@@ -24,10 +24,11 @@ type float interface {
 // The polygon parameter defines the outer boundary; each element of holes
 // defines an inner boundary (a hole) within the polygon.
 //
-// It returns the points actually used in the triangulation and a flat slice
-// of indices. Every three consecutive indices form one triangle: indices[i],
-// indices[i+1], indices[i+2]. The returned point slice may contain Steiner
-// points inserted during hole elimination or processing.
+// It returns the outer ring and all holes concatenated into one slice, and a
+// flat slice of indices into it. Every three consecutive indices form one
+// triangle: indices[i], indices[i+1], indices[i+2]. A hole with a single point
+// is a Steiner point: it is not cut out, but used as a triangle vertex.
+// Empty holes are ignored.
 func Triangulate[T float](polygon []Point[T], holes [][]Point[T]) ([]Point[T], []uint32) {
 	// count the number of points
 	pointCount := len(polygon)
@@ -70,7 +71,7 @@ type invSize[T float] struct {
 	MinX, MinY T
 }
 
-func (i *invSize[float]) Valid() bool {
+func (i *invSize[T]) Valid() bool {
 	return i.Scale > 0
 }
 
@@ -559,6 +560,10 @@ func eliminateHoles[T float](alloc *nodeAllocator[T], outer *node[T], holes [][]
 	queue := make([]*node[T], 0, len(holes))
 
 	for _, hole := range holes {
+		if len(hole) == 0 {
+			continue
+		}
+
 		list := linkedList(alloc, hole, false, indexOffset)
 		if list == list.Next {
 			list.Steiner = true

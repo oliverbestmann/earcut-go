@@ -7,7 +7,7 @@ It mirrors the original behaviour and aims to be a drop-in equivalent for polygo
 
 The code is a manual port. Documentation and comments were AI-generated or refined.
 
-The API is intentionally small. There is one exported function, `Triangulate`, and one exported type, `Point[T]`, which is used to represent polygon vertices. `Triangulate` takes a slice of points forming the outer polygon and an optional list of hole polygons. It returns two values: the set of points actually used in the triangulation (including any Steiner points added), and a flat slice of indices. Every consecutive group of three indices references one triangle in the output.
+The API is intentionally small. There is one exported function, `Triangulate`, and one exported type, `Point[T]`, which is used to represent polygon vertices. `Triangulate` takes a slice of points forming the outer polygon and an optional list of hole polygons. It returns two values: the outer ring and all holes concatenated into one slice, and a flat slice of indices into that slice. Every consecutive group of three indices references one triangle in the output.
 
 Signature:
 

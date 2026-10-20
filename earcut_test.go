@@ -53,6 +53,13 @@ func TestEarCut(t *testing.T) {
 	}
 }
 
+func TestEmptyHoleIsIgnored(t *testing.T) {
+	square := []Point[float64]{{0, 0}, {10, 0}, {10, 10}, {0, 10}}
+	_, expected := Triangulate(square, nil)
+	_, indices := Triangulate(square, [][]Point[float64]{{}})
+	require.Equal(t, expected, indices)
+}
+
 func dataToPoints(data [][][2]float64) ([]Point[float64], [][]Point[float64]) {
 	outer := pointsOf(data[0])
 
