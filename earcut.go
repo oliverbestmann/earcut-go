@@ -7,7 +7,6 @@ package earcut
 import (
 	"math"
 	"slices"
-	"strconv"
 )
 
 // Point is a 2D point with X and Y coordinates.
@@ -30,167 +29,739 @@ type float interface {
 // is a Steiner point: it is not cut out, but used as a triangle vertex.
 // Empty holes are ignored.
 func Triangulate[T float](polygon []Point[T], holes [][]Point[T]) ([]Point[T], []uint32) {
-	// count the number of points
-	pointCount := len(polygon)
-	for _, hole := range holes {
-		pointCount += len(hole)
+	points := concatRings(polygon, holes)
+
+	e := &earcut[T]{
+		alloc: nodeAllocator[T]{Expected: len(points) + 2*len(holes)},
 	}
 
-	// collect all points
-	points := make([]Point[T], 0, pointCount)
+	outer := e.linkedList(polygon, 0, true)
+	if outer == nil || outer.Next == outer.Prev {
+		return points, nil
+	}
+
+	if slices.ContainsFunc(holes, func(hole []Point[T]) bool { return len(hole) > 0 }) {
+		outer = e.eliminateHoles(outer, holes, uint32(len(polygon)), len(points))
+	}
+
+	// if the shape is not too simple, we'll use z-order curve hash later; calculate polygon bbox.
+	// like upstream, only the outer ring is used for the bbox.
+	if len(points) > 80 {
+		minX, minY := polygon[0].X, polygon[0].Y
+		maxX, maxY := minX, minY
+
+		for _, p := range polygon[1:] {
+			minX = min(minX, p.X)
+			minY = min(minY, p.Y)
+			maxX = max(maxX, p.X)
+			maxY = max(maxY, p.Y)
+		}
+
+		// minX, minY and invSize are later used to transform coords into integers for z-order calculation
+		e.minX, e.minY = minX, minY
+		if size := max(maxX-minX, maxY-minY); size != 0 {
+			e.invSize = 32767 / size
+		}
+	}
+
+	e.triangles = make([]uint32, 0, 3*len(points))
+
+	e.earcutLinked(outer)
+	for len(e.splitStack) > 0 {
+		last := len(e.splitStack) - 1
+		ear := e.splitStack[last]
+		e.splitStack = e.splitStack[:last]
+		e.earcutLinked(ear)
+	}
+
+	return points, e.triangles
+}
+
+func concatRings[T float](polygon []Point[T], holes [][]Point[T]) []Point[T] {
+	count := len(polygon)
+	for _, hole := range holes {
+		count += len(hole)
+	}
+
+	points := make([]Point[T], 0, count)
 	points = append(points, polygon...)
 	for _, hole := range holes {
 		points = append(points, hole...)
 	}
 
-	var invSize invSize[T]
-	if len(points) > 80 {
-		invSize = calculateInvSize(points)
-	}
-
-	alloc := &nodeAllocator[T]{
-		Expected: len(points) + 2*len(holes),
-	}
-
-	// create a linked node list
-	outer := linkedList(alloc, polygon, true, 0)
-
-	if outer == nil || outer.Next == outer.Prev {
-		return nil, nil
-	}
-
-	outer = eliminateHoles(alloc, outer, holes, uint32(len(polygon)))
-
-	// rough estimate on the amount of indices we'll need
-	triangles := make([]uint32, 0, len(points)*3)
-	return points, earcutLinked(alloc, outer, triangles, invSize, 0)
+	return points
 }
 
-type invSize[T float] struct {
-	Scale      T
-	MinX, MinY T
+// earcut holds the state of a single Triangulate call. Upstream keeps this in module level variables.
+type earcut[T float] struct {
+	alloc     nodeAllocator[T]
+	triangles []uint32
+
+	// z-order hashing is used if invSize is not zero
+	minX, minY, invSize T
+
+	// halves of split polygons waiting to be triangulated, so the call stack does not
+	// grow with the nesting depth of splits
+	splitStack []*node[T]
+
+	// set by filterPoints whenever it removes at least one node
+	filteredOut bool
+
+	// true only while eliminateHoles merges holes, so removeNode keeps the block index live
+	indexActive bool
+
+	// block index for findHoleBridge, see indexSegment
+	blockBBox []T // minX, minY, maxX, maxY per block
+	blockHead []*node[T]
+	blockStop []*node[T]
+
+	// scratch buffers for sorting nodes by z-order
+	sortArr, sortBuf []*node[T]
+	zArr, zBuf       []uint32
 }
 
-func (i *invSize[T]) Valid() bool {
-	return i.Scale > 0
+// create a circular doubly linked list from polygon points in the specified winding order
+func (e *earcut[T]) linkedList(points []Point[T], indexOffset uint32, clockwise bool) *node[T] {
+	var last *node[T]
+
+	if clockwise == (signedArea(points) > 0) {
+		for i, point := range points {
+			last = e.insertNode(uint32(i)+indexOffset, point, last)
+		}
+	} else {
+		for i := len(points) - 1; i >= 0; i-- {
+			last = e.insertNode(uint32(i)+indexOffset, points[i], last)
+		}
+	}
+
+	if last != nil && last.EqualTo(last.Next) {
+		e.removeNode(last)
+		last = last.Next
+	}
+
+	return last
 }
 
-func calculateInvSize[T float](points []Point[T]) invSize[T] {
-	minX := points[0].X
-	maxX := points[0].X
+// filterPoints removes collinear or coincident points. If end equals start, it sweeps the
+// whole ring until nothing can be removed. Otherwise it only heals the window between start
+// and end around a bridge or diagonal cut.
+func (e *earcut[T]) filterPoints(start, end *node[T]) *node[T] {
+	full := end == start
 
-	minY := points[0].Y
-	maxY := points[0].Y
+	p := start
+	for {
+		again := false
 
-	for _, point := range points[1:] {
-		minX = min(minX, point.X)
-		minY = min(minY, point.Y)
-		maxX = max(maxX, point.X)
-		maxY = max(maxY, point.Y)
+		if p != p.Next && !p.Steiner && (p.EqualTo(p.Next) || area(p.Prev, p, p.Next) == 0) {
+			if full || p == end {
+				// pull the stop bound back past the removal
+				end = p.Prev
+			}
+
+			e.filteredOut = true
+			e.removeNode(p)
+
+			// re-check the predecessor
+			p = p.Prev
+			again = true
+
+		} else if full || p != end {
+			p = p.Next
+
+			// local heal: keep looping until the sweep reaches end
+			again = !full
+		}
+
+		if !again && p == end {
+			return end
+		}
 	}
-
-	invSize := invSize[T]{
-		MinX: minX,
-		MinY: minY,
-	}
-
-	maxSize := max(maxX-minX, maxY-minY)
-	if maxSize != 0 {
-		invSize.Scale = 32767 / maxSize
-	}
-
-	return invSize
 }
 
-func earcutLinked[T float](alloc *nodeAllocator[T], ear *node[T], triangles []uint32, invSize invSize[T], pass int) []uint32 {
-	if ear == nil {
-		return triangles
+// main ear slicing loop which triangulates a polygon (given as a linked list)
+func (e *earcut[T]) earcutLinked(ear *node[T]) {
+	hashed := e.invSize != 0
+
+	// interlink polygon nodes in z-order
+	if hashed {
+		e.indexCurve(ear)
 	}
 
-	if pass == 0 && invSize.Valid() {
-		indexCurve(ear, invSize)
-	}
-
+	// a strictly convex ring has no vertex that could block an ear, so skip the point checks
+	// until a candidate fails. Without this, a big convex ring is cut as one fan of long
+	// triangles and each hashed check scans O(n) points.
 	stop := ear
+	cured := false
+	convex := hashed && isConvex(ear)
 
+	// iterate through ears, slicing them one by one
 	for ear.Prev != ear.Next {
 		prev, next := ear.Prev, ear.Next
 
-		var val bool
-		if invSize.Valid() {
-			val = isEarHashed(ear, invSize)
-		} else {
-			val = isEar(ear)
-		}
-
-		if val {
-
+		if area(prev, ear, next) < 0 && (convex || (hashed && e.isEarHashed(ear)) || (!hashed && isEar(ear))) {
 			// cut off the triangle
-			triangles = append(triangles, prev.Index, ear.Index, next.Index)
+			e.triangles = append(e.triangles, prev.Index, ear.Index, next.Index)
 
-			removeNode(ear)
-
-			ear = next.Next
-			stop = next.Next
-
+			e.removeNode(ear)
+			ear = next
+			stop = next
 			continue
 		}
 
+		convex = false
 		ear = next
 
+		// if we looped through the whole remaining polygon and can't find any more ears
 		if ear == stop {
-			switch pass {
-			case 0:
-				points := filterPoints(ear, nil)
-				triangles = earcutLinked(alloc, points, triangles, invSize, 1)
-
-			case 1:
-				// if this didn't work, try curing all small self-intersections locally
-				ear, triangles = cureLocalIntersections(filterPoints(ear, nil), triangles)
-				triangles = earcutLinked(alloc, ear, triangles, invSize, 2)
-
-			case 2:
-				triangles = splitEarcut(alloc, ear, triangles, invSize)
+			// try filtering collinear/coincident points and slicing again. Repeat as long as
+			// filtering removes nodes, since each removal can expose new ears.
+			e.filteredOut = false
+			ear = e.filterPoints(ear, ear)
+			if e.filteredOut {
+				stop = ear
+				continue
 			}
 
+			// filtering is exhausted: cure small local self-intersections once, then retry
+			if !cured {
+				ear = e.cureLocalIntersections(ear)
+				stop = ear
+				cured = true
+				continue
+			}
+
+			// as a last resort, try splitting the remaining polygon into two
+			e.splitEarcut(ear)
 			break
 		}
 	}
-
-	return triangles
 }
 
-func indexCurve[T float](start *node[T], invSize invSize[T]) {
+// check whether every vertex of a ring is strictly convex
+func isConvex[T float](start *node[T]) bool {
 	p := start
-
 	for {
-		if p.Z == 0 {
-			p.Z = zOrder(p.Point, invSize)
+		if area(p.Prev, p, p.Next) >= 0 {
+			return false
 		}
 
-		p.PrevZ = p.Prev
-		p.NextZ = p.Next
+		p = p.Next
+		if p == start {
+			return true
+		}
+	}
+}
+
+// check whether a polygon node forms a valid ear with adjacent nodes.
+// The reflex check is done by the caller.
+func isEar[T float](ear *node[T]) bool {
+	a, b, c := ear.Prev, ear, ear.Next
+
+	// triangle bbox
+	x0 := min(a.X, b.X, c.X)
+	y0 := min(a.Y, b.Y, c.Y)
+	x1 := max(a.X, b.X, c.X)
+	y1 := max(a.Y, b.Y, c.Y)
+
+	// make sure we don't have other points inside the potential ear
+	for p := c.Next; p != a; p = p.Next {
+		if p.X >= x0 && p.X <= x1 && p.Y >= y0 && p.Y <= y1 && a.Point != p.Point &&
+			pointInTriangle(a.Point, b.Point, c.Point, p.Point) && area(p.Prev, p, p.Next) >= 0 {
+			return false
+		}
+	}
+
+	return true
+}
+
+// like isEar, but uses the z-order index to only check nearby points
+func (e *earcut[T]) isEarHashed(ear *node[T]) bool {
+	a, b, c := ear.Prev, ear, ear.Next
+
+	// triangle bbox
+	x0 := min(a.X, b.X, c.X)
+	y0 := min(a.Y, b.Y, c.Y)
+	x1 := max(a.X, b.X, c.X)
+	y1 := max(a.Y, b.Y, c.Y)
+
+	// z-order range for the current triangle bbox
+	minZ := e.zOrder(x0, y0)
+	maxZ := e.zOrder(x1, y1)
+
+	// look for points inside the triangle in decreasing z-order
+	for p := ear.PrevZ; p != nil && p.Z >= minZ; p = p.PrevZ {
+		if p.X >= x0 && p.X <= x1 && p.Y >= y0 && p.Y <= y1 && p != c && a.Point != p.Point &&
+			pointInTriangle(a.Point, b.Point, c.Point, p.Point) && area(p.Prev, p, p.Next) >= 0 {
+			return false
+		}
+	}
+
+	// look for points in increasing z-order
+	for n := ear.NextZ; n != nil && n.Z <= maxZ; n = n.NextZ {
+		if n.X >= x0 && n.X <= x1 && n.Y >= y0 && n.Y <= y1 && n != c && a.Point != n.Point &&
+			pointInTriangle(a.Point, b.Point, c.Point, n.Point) && area(n.Prev, n, n.Next) >= 0 {
+			return false
+		}
+	}
+
+	return true
+}
+
+// go through all polygon nodes and cure small local self-intersections
+func (e *earcut[T]) cureLocalIntersections(start *node[T]) *node[T] {
+	p := start
+	cured := false
+
+	for {
+		a := p.Prev
+		b := p.Next.Next
+
+		if intersects(a, p, p.Next, b, false) && locallyInside(a, b) && locallyInside(b, a) {
+			e.triangles = append(e.triangles, a.Index, p.Index, b.Index)
+
+			// remove two nodes involved
+			e.removeNode(p)
+			e.removeNode(p.Next)
+
+			p = b
+			start = b
+			cured = true
+		}
 
 		p = p.Next
-
 		if p == start {
 			break
 		}
 	}
 
-	p.PrevZ.NextZ = nil
-	p.PrevZ = nil
+	if cured {
+		return e.filterPoints(p, p)
+	}
 
-	sortLinked(p)
+	return p
 }
 
-// z-order of a point given coords and inverse of the longer side of data bbox
-func zOrder[T float](point Point[T], invSize invSize[T]) uint64 {
-	xf, yf := point.X, point.Y
+// try splitting polygon into two and triangulate them independently
+func (e *earcut[T]) splitEarcut(start *node[T]) {
+	// look for a valid diagonal that divides the polygon into two
+	a := start
+	for {
+		for b := a.Next.Next; b != a.Prev; b = b.Next {
+			if a.Index != b.Index && isValidDiagonal(a, b) {
+				// split the polygon in two by the diagonal
+				c := e.splitPolygon(a, b)
 
+				// filter collinear points around the cuts
+				a = e.filterPoints(a, a.Next)
+				c = e.filterPoints(c, c.Next)
+
+				// queue both halves, a on top so it's triangulated first
+				e.splitStack = append(e.splitStack, c, a)
+				return
+			}
+		}
+
+		a = a.Next
+		if a == start {
+			return
+		}
+	}
+}
+
+// link every hole into the outer loop, producing a single-ring polygon without holes
+func (e *earcut[T]) eliminateHoles(outer *node[T], holes [][]Point[T], indexOffset uint32, maxNodes int) *node[T] {
+	queue := make([]*node[T], 0, len(holes))
+
+	for _, hole := range holes {
+		if len(hole) == 0 {
+			continue
+		}
+
+		list := e.linkedList(hole, indexOffset, false)
+		if list == list.Next {
+			list.Steiner = true
+		}
+
+		queue = append(queue, getLeftmost(list))
+		indexOffset += uint32(len(hole))
+	}
+
+	slices.SortStableFunc(queue, compareXYSlope)
+
+	// seed the block index with the outer ring, each merged hole is appended later
+	e.buildBlockIndex(maxNodes, len(queue))
+	e.indexSegment(outer, outer)
+
+	// process holes from left to right
+	e.indexActive = true
+	for _, hole := range queue {
+		outer = e.eliminateHole(hole, outer)
+	}
+	e.indexActive = false
+
+	// collapse collinear/coincident points across the whole merged ring once before clipping
+	return e.filterPoints(outer, outer)
+}
+
+func compareXYSlope[T float](a, b *node[T]) int {
+	// when the left-most point of 2 holes meet at a vertex, sort the holes counterclockwise so that when we find
+	// the bridge to the outer shell is always the point that they meet at.
+	// NaN is treated like zero, as in javascript.
+	result := a.X - b.X
+	if result == 0 || result != result {
+		result = a.Y - b.Y
+	}
+
+	if result == 0 || result != result {
+		result = (a.Next.Y-a.Y)/(a.Next.X-a.X) - (b.Next.Y-b.Y)/(b.Next.X-b.X)
+	}
+
+	return sign(result)
+}
+
+func sign[T float](value T) int {
+	switch {
+	case value > 0:
+		return 1
+	case value < 0:
+		return -1
+	default:
+		return 0
+	}
+}
+
+// find a bridge between vertices that connects hole with an outer ring and link it
+func (e *earcut[T]) eliminateHole(hole, outer *node[T]) *node[T] {
+	bridge := e.findHoleBridge(hole, outer)
+	if bridge == nil {
+		return outer
+	}
+
+	bridgeReverse := e.splitPolygon(bridge, hole)
+
+	// index the merged-in segment before filtering. In ring order the splice runs
+	// bridge -> hole -> bridgeReverse -> bridge2 -> (bridge's old next).
+	bridge2 := bridgeReverse.Next
+	e.indexSegment(bridge, bridge2.Next)
+
+	// heal collinear/coincident points around the two new slit edges, but leave bridge2 alone: dropping it as
+	// collinear would leave bridge lying on the healed edge, where a later hole could bridge into it from outside
+	// its sector
+	e.filterPoints(bridgeReverse.Prev, bridgeReverse)
+	return e.filterPoints(bridge, bridge.Next)
+}
+
+// Block index for findHoleBridge: one bbox per blockSize consecutive ring edges, so the
+// leftward-ray scan can skip whole blocks instead of walking the entire merged ring.
+// The outer ring is indexed first, then each merged hole appends its own segment.
+//
+// filterPoints only drops collinear/coincident points, so an old bbox still covers its
+// live edges. The scan skips removed nodes. Blocks are scanned in append order, not ring
+// order, which can pick a different (but valid) bridge than a plain ring walk.
+const blockSize = 16
+
+func (e *earcut[T]) buildBlockIndex(maxNodes, numHoles int) {
+	// every input node indexed once, +2 bridge nodes per hole, plus a partial
+	// trailing block per appended segment
+	maxBlocks := (maxNodes+2*numHoles+blockSize-1)/blockSize + numHoles + 2
+
+	e.blockBBox = make([]T, 0, 4*maxBlocks)
+	e.blockHead = make([]*node[T], 0, maxBlocks)
+	e.blockStop = make([]*node[T], 0, maxBlocks)
+}
+
+// index the ring run head..stop (exclusive) as blocks of up to blockSize edges.
+// If head equals stop, the whole ring is indexed.
+func (e *earcut[T]) indexSegment(head, stop *node[T]) {
+	p := head
+	for {
+		block := int32(len(e.blockHead))
+		e.blockHead = append(e.blockHead, p)
+
+		minX, minY, maxX, maxY := p.X, p.Y, p.X, p.Y
+
+		for k := 0; ; {
+			// edge p->c, the bbox must cover both endpoints
+			c := p.Next
+
+			// reuse z as the owning block during eliminateHoles, see growBlock
+			p.Z = block
+
+			minX = min(minX, c.X)
+			minY = min(minY, c.Y)
+			maxX = max(maxX, c.X)
+			maxY = max(maxY, c.Y)
+
+			p = c
+
+			k++
+			if k >= blockSize || p == stop {
+				break
+			}
+		}
+
+		e.blockStop = append(e.blockStop, p)
+		e.blockBBox = append(e.blockBBox, minX, minY, maxX, maxY)
+
+		if p == stop {
+			return
+		}
+	}
+}
+
+// when filterPoints heals an edge head->tail by removing the node between them, the new
+// edge can reach outside of the bbox of head's block. Grow the bbox to cover tail.
+func (e *earcut[T]) growBlock(head, tail *node[T]) {
+	bbox := e.blockBBox[head.Z*4:][:4]
+	bbox[0] = min(bbox[0], tail.X)
+	bbox[1] = min(bbox[1], tail.Y)
+	bbox[2] = max(bbox[2], tail.X)
+	bbox[3] = max(bbox[3], tail.Y)
+}
+
+func (e *earcut[T]) liveBlockStop(b int) *node[T] {
+	stop := e.blockStop[b]
+	for !stop.alive() {
+		stop = stop.Next
+	}
+
+	e.blockStop[b] = stop
+	return stop
+}
+
+// the head node of a block can be removed by filterPoints during merges. Advance it to
+// the next live node so the walk does not start on a removed node.
+func (e *earcut[T]) liveBlockHead(b int) *node[T] {
+	head := e.blockHead[b]
+	for !head.alive() {
+		head = head.Next
+	}
+
+	e.blockHead[b] = head
+	return head
+}
+
+// David Eberly's algorithm for finding a bridge between hole and outer polygon
+func (e *earcut[T]) findHoleBridge(hole, outer *node[T]) *node[T] {
+	hx, hy := hole.X, hole.Y
+	qx := T(math.Inf(-1))
+
+	var m *node[T]
+
+	// find a segment intersected by a ray from the hole's leftmost point to the left;
+	// segment's endpoint with lesser x will be potential connection point
+	// unless they intersect at a vertex, then choose the vertex
+	if hole.EqualTo(outer) {
+		return outer
+	}
+
+	// skip blocks whose bbox can't hold a crossing that beats qx and lies left of hx
+	bbox := e.blockBBox
+	for b := range e.blockHead {
+		g := 4 * b
+		if hy < bbox[g+1] || hy > bbox[g+3] || bbox[g] > hx || bbox[g+2] <= qx {
+			continue
+		}
+
+		stop := e.liveBlockStop(b)
+
+		p := e.liveBlockHead(b)
+		for {
+			if hole.EqualTo(p.Next) {
+				return p.Next
+			}
+
+			if hy <= p.Y && hy >= p.Next.Y && p.Next.Y != p.Y {
+				x := p.X + (hy-p.Y)*(p.Next.X-p.X)/(p.Next.Y-p.Y)
+				if x <= hx && x > qx {
+					qx = x
+					m = pick(p.X < p.Next.X, p, p.Next)
+
+					if x == hx {
+						// hole touches outer segment; pick leftmost endpoint
+						return m
+					}
+				}
+			}
+
+			p = p.Next
+			if p == stop {
+				break
+			}
+		}
+	}
+
+	if m == nil {
+		return nil
+	}
+
+	// look for points inside the triangle of hole point, segment intersection and endpoint;
+	// if there are no points found, we have a valid connection;
+	// otherwise choose the point of the minimum angle with the ray as connection point
+
+	mx, my := m.X, m.Y
+
+	// the triangle's y span; x span is [mx, hx]
+	tminY := min(hy, my)
+	tmaxY := max(hy, my)
+
+	tanMin := T(math.Inf(1))
+
+	t0 := Point[T]{X: pick(hy < my, hx, qx), Y: hy}
+	t1 := Point[T]{X: mx, Y: my}
+	t2 := Point[T]{X: pick(hy < my, qx, hx), Y: hy}
+
+	// skip blocks whose bbox can't overlap the triangle's bbox
+	for b := range e.blockHead {
+		g := 4 * b
+		if bbox[g+2] < mx || bbox[g] > hx || bbox[g+3] < tminY || bbox[g+1] > tmaxY {
+			continue
+		}
+
+		stop := e.liveBlockStop(b)
+
+		p := e.liveBlockHead(b)
+		for {
+			if hx >= p.X && p.X >= mx && hx != p.X && pointInTriangle(t0, t1, t2, p.Point) {
+				// tangential
+				tan := T(math.Abs(float64(hy-p.Y))) / (hx - p.X)
+
+				// if hole point sits on p's horizontal edge (T-junction touch): the bridge runs
+				// along that edge. locallyInside rejects it as collinear, but it's valid.
+				if (locallyInside(p, hole) || (p.Y == hy && p.Next.Y == hy && p.Next.X > hx)) &&
+					(tan < tanMin || (tan == tanMin && (p.X > m.X || (p.X == m.X && sectorContainsSector(m, p))))) {
+					m = p
+					tanMin = tan
+				}
+			}
+
+			p = p.Next
+			if p == stop {
+				break
+			}
+		}
+	}
+
+	return m
+}
+
+func pick[T any](cond bool, a, b T) T {
+	if cond {
+		return a
+	}
+
+	return b
+}
+
+// whether sector in vertex m contains sector in vertex p in the same coordinates
+func sectorContainsSector[T float](m, p *node[T]) bool {
+	return area(m.Prev, m, p.Prev) < 0 && area(p.Next, m, m.Next) < 0
+}
+
+// interlink polygon nodes in z-order: collect into a slice, sort by z, relink
+func (e *earcut[T]) indexCurve(start *node[T]) {
+	nodes := e.sortArr[:0]
+
+	p := start
+	for {
+		// always recompute: z may still hold a block index left over from eliminateHoles
+		p.Z = e.zOrder(p.X, p.Y)
+		nodes = append(nodes, p)
+
+		p = p.Next
+		if p == start {
+			break
+		}
+	}
+
+	e.sortArr = nodes
+	e.sortNodes()
+
+	var prev *node[T]
+	for _, n := range e.sortArr {
+		n.PrevZ = prev
+		if prev != nil {
+			prev.NextZ = n
+		}
+
+		prev = n
+	}
+
+	prev.NextZ = nil
+}
+
+// sort sortArr by z, in place: insertion sort for small slices, else LSD radix sort in
+// four 8-bit passes. Like upstream, insertion sort compares z as signed and radix sort
+// as unsigned. This only matters for points outside the outer ring's bbox.
+func (e *earcut[T]) sortNodes() {
+	nodes := e.sortArr
+	n := len(nodes)
+
+	if n <= 32 {
+		for i := 1; i < n; i++ {
+			node := nodes[i]
+
+			j := i - 1
+			for j >= 0 && nodes[j].Z > node.Z {
+				nodes[j+1] = nodes[j]
+				j--
+			}
+
+			nodes[j+1] = node
+		}
+
+		return
+	}
+
+	if len(e.zArr) < n {
+		e.zArr = make([]uint32, n)
+		e.zBuf = make([]uint32, n)
+		e.sortBuf = make([]*node[T], n)
+	}
+
+	zArr, zBuf, buf := e.zArr[:n], e.zBuf[:n], e.sortBuf[:n]
+	for i, node := range nodes {
+		zArr[i] = uint32(node.Z)
+	}
+
+	// even pass count lands the sorted result back in nodes
+	radixPass(nodes, zArr, buf, zBuf, 0)
+	radixPass(buf, zBuf, nodes, zArr, 8)
+	radixPass(nodes, zArr, buf, zBuf, 16)
+	radixPass(buf, zBuf, nodes, zArr, 24)
+}
+
+// one LSD radix pass: stably scatter the nodes (and their z) from src to dst,
+// bucketed by the 8-bit digit of z at the given bit shift
+func radixPass[T float](src []*node[T], srcZ []uint32, dst []*node[T], dstZ []uint32, shift uint) {
+	var counts [256]uint32
+	for _, z := range srcZ {
+		counts[(z>>shift)&0xff]++
+	}
+
+	// turn per-bucket counts into start offsets (prefix sum)
+	var sum uint32
+	for b, c := range counts {
+		counts[b] = sum
+		sum += c
+	}
+
+	for i, z := range srcZ {
+		digit := (z >> shift) & 0xff
+		pos := counts[digit]
+		counts[digit]++
+
+		dst[pos] = src[i]
+		dstZ[pos] = z
+	}
+}
+
+// z-order of a point given coords and inverse of the longer side of data bbox.
+// The integer math mirrors javascript's 32-bit integer semantics.
+func (e *earcut[T]) zOrder(xf, yf T) int32 {
 	// coords are transformed into non-negative 15-bit integer range
-	x := uint64((xf - invSize.MinX) * invSize.Scale)
-	y := uint64((yf - invSize.MinY) * invSize.Scale)
+	x := toInt32((xf - e.minX) * e.invSize)
+	y := toInt32((yf - e.minY) * e.invSize)
 
 	x = (x | (x << 8)) & 0x00ff00ff
 	x = (x | (x << 4)) & 0x0f0f0f0f
@@ -205,588 +776,9 @@ func zOrder[T float](point Point[T], invSize invSize[T]) uint64 {
 	return x | (y << 1)
 }
 
-// Simon Tatham's linked list merge sort algorithm
-// http://www.chiark.greenend.org.uk/~sgtatham/algorithms/listsort.html
-func sortLinked[T float](list *node[T]) *node[T] {
-	inSize := 1
-
-	for {
-		var e, tail *node[T]
-		var numMerges int
-
-		p := list
-		list = nil
-
-		for p != nil {
-			numMerges += 1
-			q := p
-			pSize := 0
-
-			for range inSize {
-				pSize++
-				q = q.NextZ
-				if q == nil {
-					break
-				}
-			}
-
-			qSize := inSize
-
-			for pSize > 0 || (qSize > 0 && q != nil) {
-				if pSize != 0 && (qSize == 0 || q == nil || p.Z <= q.Z) {
-					e = p
-					p = p.NextZ
-					pSize--
-				} else {
-					e = q
-					q = q.NextZ
-					qSize--
-				}
-
-				if tail != nil {
-					tail.NextZ = e
-				} else {
-					list = e
-				}
-
-				e.PrevZ = tail
-				tail = e
-
-			}
-
-			p = q
-		}
-
-		if tail == nil {
-			// this should not happen
-			panic("tail not assigned")
-		}
-
-		tail.NextZ = nil
-		inSize *= 2
-
-		if numMerges <= 1 {
-			break
-		}
-	}
-
-	return list
-}
-
-// check whether a polygon node forms a valid ear with adjacent nodes
-func isEar[T float](ear *node[T]) bool {
-	a := ear.Prev
-	b := ear
-	c := ear.Next
-
-	// reflex, can't be an ear
-	if area(a.Point, b.Point, c.Point) >= 0 {
-		return false
-	}
-
-	// now make sure we don't have other points inside the potential ear
-	// triangle bbox
-	x0 := min(a.X, b.X, c.X)
-	y0 := min(a.Y, b.Y, c.Y)
-	x1 := max(a.X, b.X, c.X)
-	y1 := max(a.Y, b.Y, c.Y)
-
-	p := c.Next
-
-	for p != a {
-		if p.X >= x0 && p.X <= x1 && p.Y >= y0 && p.Y <= y1 &&
-			pointInTriangleExceptFirst(a.Point, b.Point, c.Point, p.Point) &&
-			area(p.Prev.Point, p.Point, p.Next.Point) >= 0 {
-
-			return false
-		}
-
-		p = p.Next
-	}
-
-	return true
-}
-
-func isEarHashed[T float](ear *node[T], invSize invSize[T]) bool {
-	a := ear.Prev
-	b := ear
-	c := ear.Next
-
-	if area(a.Point, b.Point, c.Point) >= 0 {
-		// reflex, can't be an ear
-		return false
-	}
-
-	// triangle bbox
-	x0 := min(a.X, b.X, c.X)
-	y0 := min(a.Y, b.Y, c.Y)
-	x1 := max(a.X, b.X, c.X)
-	y1 := max(a.Y, b.Y, c.Y)
-
-	// z-order range for the current triangle bbox;
-	minZ := zOrder(Point[T]{X: x0, Y: y0}, invSize)
-	maxZ := zOrder(Point[T]{X: x1, Y: y1}, invSize)
-
-	p := ear.PrevZ
-	n := ear.NextZ
-
-	// look for points inside the triangle in both directions
-	for p != nil && p.Z >= minZ && n != nil && n.Z <= maxZ {
-		if p.X >= x0 &&
-			p.X <= x1 &&
-			p.Y >= y0 &&
-			p.Y <= y1 &&
-			p != a &&
-			p != c &&
-			pointInTriangleExceptFirst(a.Point, b.Point, c.Point, p.Point) &&
-			area(p.Prev.Point, p.Point, p.Next.Point) >= 0 {
-			return false
-		}
-
-		p = p.PrevZ
-
-		if n.X >= x0 &&
-			n.X <= x1 &&
-			n.Y >= y0 &&
-			n.Y <= y1 &&
-			n != a &&
-			n != c &&
-			pointInTriangleExceptFirst(a.Point, b.Point, c.Point, n.Point) &&
-			area(n.Prev.Point, n.Point, n.Next.Point) >= 0 {
-			return false
-		}
-
-		n = n.NextZ
-	}
-
-	// look for remaining points in decreasing z-order
-	for p != nil && p.Z >= minZ {
-		if p.X >= x0 &&
-			p.X <= x1 &&
-			p.Y >= y0 &&
-			p.Y <= y1 &&
-			p != a &&
-			p != c &&
-			pointInTriangleExceptFirst(a.Point, b.Point, c.Point, p.Point) &&
-			area(p.Prev.Point, p.Point, p.Next.Point) >= 0 {
-			return false
-		}
-
-		p = p.PrevZ
-	}
-
-	// look for remaining points in increasing z-order
-	for n != nil && n.Z <= maxZ {
-		if n.X >= x0 &&
-			n.X <= x1 &&
-			n.Y >= y0 &&
-			n.Y <= y1 &&
-			n != a &&
-			n != c &&
-			pointInTriangleExceptFirst(a.Point, b.Point, c.Point, n.Point) &&
-			area(n.Prev.Point, n.Point, n.Next.Point) >= 0 {
-			return false
-		}
-
-		n = n.NextZ
-	}
-
-	return true
-}
-
-func cureLocalIntersections[T float](start *node[T], triangles []uint32) (*node[T], []uint32) {
-	p := start
-
-	for {
-		a := p.Prev
-		b := p.Next.Next
-
-		if !a.EqualTo(b) && intersects(a.Point, p.Point, p.Next.Point, b.Point) && locallyInside(a, b) && locallyInside(b, a) {
-			triangles = append(triangles, a.Index, p.Index, b.Index)
-
-			// remove two nodes involved
-			removeNode(p)
-			removeNode(p.Next)
-
-			p = b
-			start = b
-		}
-
-		p = p.Next
-
-		if p == start {
-			break
-		}
-	}
-
-	return filterPoints(p, nil), triangles
-}
-
-func intersects[T float](p1, q1, p2, q2 Point[T]) bool {
-	o1 := sign(area(p1, q1, p2))
-	o2 := sign(area(p1, q1, q2))
-	o3 := sign(area(p2, q2, p1))
-	o4 := sign(area(p2, q2, q1))
-
-	if o1 != o2 && o3 != o4 {
-		return true // general case
-	}
-
-	if o1 == 0 && onSegment(p1, p2, q1) {
-		return true // p1, q1 and p2 are collinear and p2 lies on p1q1
-	}
-
-	if o2 == 0 && onSegment(p1, q2, q1) {
-		return true // p1, q1 and q2 are collinear and q2 lies on p1q1
-	}
-
-	if o3 == 0 && onSegment(p2, p1, q2) {
-		return true // p2, q2 and p1 are collinear and p1 lies on p2q2
-	}
-
-	if o4 == 0 && onSegment(p2, q1, q2) {
-		return true // p2, q2 and q1 are collinear and q1 lies on p2q2
-	}
-
-	return false
-}
-
-func onSegment[T float](p, q, r Point[T]) bool {
-	return q.X <= max(p.X, r.X) && q.X >= min(p.X, r.X) && q.Y <= max(p.Y, r.Y) && q.Y >= min(p.Y, r.Y)
-}
-
-func sign[T float](value T) int {
-	if value > 0 {
-		return 1
-	}
-
-	if value < 0 {
-		return -1
-	}
-
-	return 0
-}
-
-// try splitting polygon into two and triangulate them independently
-func splitEarcut[T float](alloc *nodeAllocator[T], start *node[T], triangles []uint32, invSize invSize[T]) []uint32 {
-	// look for a valid diagonal that divides the polygon into two
-	a := start
-
-	for {
-		b := a.Next.Next
-
-		for b != a.Prev {
-			if a.Index != b.Index && isValidDiagonal(a, b) {
-				// split the polygon in two by the diagonal
-				c := splitPolygon(alloc, a, b)
-
-				// filter co-linear points around the cuts
-				a = filterPoints(a, a.Next)
-				c = filterPoints(c, c.Next)
-
-				// run earcut on each half
-				triangles = earcutLinked(alloc, a, triangles, invSize, 0)
-				triangles = earcutLinked(alloc, c, triangles, invSize, 0)
-				return triangles
-			}
-
-			b = b.Next
-		}
-
-		a = a.Next
-
-		if a == start {
-			return triangles
-		}
-	}
-}
-
-func isValidDiagonal[T float](a, b *node[T]) bool {
-	return a.Next.Index != b.Index && a.Prev.Index != b.Index && !intersectsPolygon(a, b) && // doesn't intersect other edges
-		(locallyInside(a, b) && locallyInside(b, a) && middleInside(a, b) && // locally visible
-			(area(a.Prev.Point, a.Point, b.Prev.Point) != 0 || area(a.Point, b.Prev.Point, b.Point) != 0) || // does not create opposite-facing sectors
-			a.EqualTo(b) && area(a.Prev.Point, a.Point, a.Next.Point) > 0 && area(b.Prev.Point, b.Point, b.Next.Point) > 0) // special zero-length case
-}
-
-// check if the middle point of a polygon diagonal is inside the polygon
-func middleInside[T float](a, b *node[T]) bool {
-	p := a
-	var inside bool
-
-	px := (a.X + b.X) / 2
-	py := (a.Y + b.Y) / 2
-
-	for {
-		// do not remove the extra T casts, they prevent go from emitting fma instructions
-		//goland:noinspection GoRedundantConversion
-		if ((p.Y > py) != (p.Next.Y > py)) && p.Next.Y != p.Y &&
-			(px < (p.Next.X-p.X)*(T(py)-p.Y)/(p.Next.Y-p.Y)+p.X) {
-
-			inside = !inside
-		}
-
-		p = p.Next
-		if p == a {
-			break
-		}
-	}
-
-	return inside
-}
-
-// check if a polygon diagonal intersects any polygon segments
-func intersectsPolygon[T float](a, b *node[T]) bool {
-	p := a
-
-	for {
-		if p.Index != a.Index &&
-			p.Next.Index != a.Index &&
-			p.Index != b.Index &&
-			p.Next.Index != b.Index &&
-			intersects(p.Point, p.Next.Point, a.Point, b.Point) {
-
-			return true
-		}
-
-		p = p.Next
-
-		if p == a {
-			return false
-		}
-	}
-}
-
-func eliminateHoles[T float](alloc *nodeAllocator[T], outer *node[T], holes [][]Point[T], indexOffset uint32) *node[T] {
-	queue := make([]*node[T], 0, len(holes))
-
-	for _, hole := range holes {
-		if len(hole) == 0 {
-			continue
-		}
-
-		list := linkedList(alloc, hole, false, indexOffset)
-		if list == list.Next {
-			list.Steiner = true
-		}
-
-		queue = append(queue, getLeftmost(list))
-		indexOffset += uint32(len(hole))
-	}
-
-	slices.SortStableFunc(queue, func(a, b *node[T]) int {
-		return sign(compareXYSlope(a, b))
-	})
-
-	// process holes from left to right
-	for _, hole := range queue {
-		outer = eliminateHole(alloc, hole, outer)
-	}
-
-	return outer
-}
-
-func eliminateHole[T float](alloc *nodeAllocator[T], hole, outer *node[T]) *node[T] {
-	bridge := findHoleBridge(hole, outer)
-	if bridge == nil {
-		return outer
-	}
-
-	bridgeReverse := splitPolygon(alloc, bridge, hole)
-
-	// filter collinear points around the cuts
-	filterPoints(bridgeReverse, bridgeReverse.Next)
-	return filterPoints(bridge, bridge.Next)
-
-}
-
-// eliminate co-linear or duplicate points
-func filterPoints[T float](start, end *node[T]) *node[T] {
-	if start == nil {
-		return nil
-	}
-
-	if end == nil {
-		end = start
-	}
-
-	p := start
-
-	for {
-		var again bool
-		if !p.Steiner && (p.EqualTo(p.Next) || area(p.Prev.Point, p.Point, p.Next.Point) == 0) {
-			removeNode(p)
-			end = p.Prev
-			p = p.Prev
-
-			if p == p.Next {
-				break
-			}
-
-			again = true
-		} else {
-			p = p.Next
-		}
-
-		if !again && p == end {
-			break
-		}
-	}
-
-	return end
-}
-
-func findHoleBridge[T float](hole, outer *node[T]) *node[T] {
-	p := outer
-	hx, hy := hole.X, hole.Y
-	qx := T(math.Inf(-1))
-
-	var m *node[T]
-
-	// find a segment intersected by a ray from the hole's leftmost point to the left;
-	// segment's endpoint with lesser x will be potential connection point
-	// unless they intersect at a vertex, then choose the vertex
-	if hole.EqualTo(p) {
-		return p
-	}
-
-	for {
-		if hole.EqualTo(p.Next) {
-			return p.Next
-		}
-
-		if hy <= p.Y && hy >= p.Next.Y && p.Next.Y != p.Y {
-			x := p.X + (hy-p.Y)*(p.Next.X-p.X)/(p.Next.Y-p.Y)
-			if x <= hx && x > qx {
-				qx = x
-				m = pick(p.X < p.Next.X, p, p.Next)
-
-				if x == hx {
-					// hole touches outer segment; pick leftmost endpoint
-					return m
-				}
-			}
-		}
-
-		p = p.Next
-
-		if p == outer {
-			break
-		}
-	}
-
-	if m == nil {
-		return nil
-	}
-
-	// look for points inside the triangle of hole point, segment intersection and endpoint;
-	// if there are no points found, we have a valid connection;
-	// otherwise choose the point of the minimum angle with the ray as connection point
-
-	stop := m
-	mx, my := m.X, m.Y
-	tanMin := T(math.Inf(1))
-
-	p = m
-
-	for {
-		p0 := Point[T]{X: pick(hy < my, hx, qx), Y: hy}
-		p1 := Point[T]{X: mx, Y: my}
-		p2 := Point[T]{X: pick(hy < my, qx, hx), Y: hy}
-
-		if hx >= p.X && p.X >= mx && hx != p.X && pointInTriangle(p0, p1, p2, p.Point) {
-			tan := T(math.Abs(float64(hy-p.Y))) / (hx - p.X) // tangential
-
-			if locallyInside(p, hole) &&
-				(tan < tanMin || (tan == tanMin && (p.X > m.X || (p.X == m.X && sectorContainsSector(m, p))))) {
-
-				m = p
-				tanMin = tan
-
-			}
-		}
-
-		p = p.Next
-
-		if p == stop {
-			break
-		}
-	}
-
-	return m
-}
-
-func pick[T any](cond bool, a, b T) T {
-	if cond {
-		return a
-	} else {
-		return b
-	}
-}
-
-func pointInTriangle[T float](a, b, c, p Point[T]) bool {
-	return (c.X-p.X)*(a.Y-p.Y) >= (a.X-p.X)*(c.Y-p.Y) &&
-		(a.X-p.X)*(b.Y-p.Y) >= (b.X-p.X)*(a.Y-p.Y) &&
-		(b.X-p.X)*(c.Y-p.Y) >= (c.X-p.X)*(b.Y-p.Y)
-}
-
-func pointInTriangleExceptFirst[T float](a, b, c, p Point[T]) bool {
-	return a != p && pointInTriangle(a, b, c, p)
-}
-
-// signed area of a triangle
-func area[T float](p, q, r Point[T]) T {
-	// do not remove the extra T casts, they prevent go from emitting fma instructions
-	//goland:noinspection GoRedundantConversion
-	return T((q.Y-p.Y)*(r.X-q.X)) - T((q.X-p.X)*(r.Y-q.Y))
-}
-
-// check if a polygon diagonal is locally inside the polygon
-func locallyInside[T float](a, b *node[T]) bool {
-	v := area(a.Prev.Point, a.Point, a.Next.Point)
-	if v < 0 {
-		return area(a.Point, b.Point, a.Next.Point) >= 0 &&
-			area(a.Point, a.Prev.Point, b.Point) >= 0
-	} else {
-		return area(a.Point, b.Point, a.Prev.Point) < 0 ||
-			area(a.Point, a.Next.Point, b.Point) < 0
-	}
-}
-
-// whether sector in vertex m contains sector in vertex p in the same coordinates
-func sectorContainsSector[T float](m, p *node[T]) bool {
-	return area(m.Prev.Point, m.Point, p.Prev.Point) < 0 &&
-		area(p.Next.Point, m.Point, m.Next.Point) < 0
-}
-
-func compareXYSlope[T float](a, b *node[T]) T {
-	result := a.X - b.X
-
-	// when the left-most point of 2 holes meet at a vertex, sort the holes counterclockwise so that when we find
-	// the bridge to the outer shell is always the point that they meet at.
-	if result == 0 {
-		result = a.Y - b.Y
-		if result == 0 {
-			aSlope := (a.Next.Y - a.Y) / (a.Next.X - a.X)
-			bSlope := (b.Next.Y - b.Y) / (b.Next.X - b.X)
-			result = aSlope - bSlope
-		}
-	}
-
-	return result
-}
-
-func signedArea[T float](points []Point[T]) T {
-	var sum T
-
-	for i := 0; i < len(points); i++ {
-		j := (i - 1 + len(points)) % len(points)
-
-		// do not remove the extra T casts, they prevent go from emitting fma instructions
-		//goland:noinspection GoRedundantConversion
-		sum += T((points[j].X - points[i].X) * (points[i].Y + points[j].Y))
-	}
-
-	return sum
+// toInt32 works like javascript's "value | 0": truncate, then wrap to 32 bits
+func toInt32[T float](value T) int32 {
+	return int32(int64(value))
 }
 
 // find the leftmost node of a polygon ring
@@ -800,99 +792,128 @@ func getLeftmost[T float](start *node[T]) *node[T] {
 		}
 
 		p = p.Next
-
 		if p == start {
 			return leftmost
 		}
 	}
 }
 
-type node[T float] struct {
-	Point[T]
-	Prev, Next   *node[T]
-	PrevZ, NextZ *node[T]
-
-	Z       uint64
-	Index   uint32
-	Steiner bool
+// check if a point lies within a convex triangle
+func pointInTriangle[T float](a, b, c, p Point[T]) bool {
+	return (c.X-p.X)*(a.Y-p.Y) >= (a.X-p.X)*(c.Y-p.Y) &&
+		(a.X-p.X)*(b.Y-p.Y) >= (b.X-p.X)*(a.Y-p.Y) &&
+		(b.X-p.X)*(c.Y-p.Y) >= (c.X-p.X)*(b.Y-p.Y)
 }
 
-func (n *node[T]) String() string {
-	return strconv.Itoa(int(n.Index))
+// check if a diagonal between two polygon nodes is valid (lies in polygon interior)
+func isValidDiagonal[T float](a, b *node[T]) bool {
+	// degenerate case
+	zeroLength := a.EqualTo(b) && area(a.Prev, a, a.Next) > 0 && area(b.Prev, b, b.Next) > 0
+
+	return a.Next.Index != b.Index &&
+		// locally visible, no opposite-facing sectors
+		(zeroLength || locallyInside(a, b) && locallyInside(b, a) &&
+			(area(a.Prev, a, b.Prev) != 0 || area(a, b.Prev, b) != 0)) &&
+		// doesn't intersect other edges, diagonal inside polygon
+		!intersectsPolygon(a, b) && (zeroLength || middleInside(a, b))
 }
 
-func (n *node[T]) EqualTo(other *node[T]) bool {
-	return n.Point == other.Point
+// signed area of a triangle
+func area[T float](p, q, r *node[T]) T {
+	// do not remove the extra T casts, they prevent go from emitting fma instructions
+	//goland:noinspection GoRedundantConversion
+	return T((q.Y-p.Y)*(r.X-q.X)) - T((q.X-p.X)*(r.Y-q.Y))
 }
 
-// nodeAllocator is an internal helper for efficient node allocation.
-type nodeAllocator[T float] struct {
-	Expected int
-	buf      []node[T]
+// check if two segments intersect. If includeBoundary is set, collinear touches count.
+func intersects[T float](p1, q1, p2, q2 *node[T], includeBoundary bool) bool {
+	o1 := area(p1, q1, p2)
+	o2 := area(p1, q1, q2)
+	o3 := area(p2, q2, p1)
+	o4 := area(p2, q2, q1)
+
+	if ((o1 > 0 && o2 < 0) || (o1 < 0 && o2 > 0)) && ((o3 > 0 && o4 < 0) || (o3 < 0 && o4 > 0)) {
+		return true
+	}
+
+	if !includeBoundary {
+		return false
+	}
+
+	return o1 == 0 && onSegment(p1, p2, q1) || // p1, q1 and p2 are collinear and p2 lies on p1q1
+		o2 == 0 && onSegment(p1, q2, q1) || // p1, q1 and q2 are collinear and q2 lies on p1q1
+		o3 == 0 && onSegment(p2, p1, q2) || // p2, q2 and p1 are collinear and p1 lies on p2q2
+		o4 == 0 && onSegment(p2, q1, q2) // p2, q2 and q1 are collinear and q1 lies on p2q2
 }
 
-func (a *nodeAllocator[T]) Alloc() *node[T] {
-	if len(a.buf) == 0 {
-		count := a.Expected
+// for collinear points p, q, r, check if point q lies on segment pr
+func onSegment[T float](p, q, r *node[T]) bool {
+	return q.X <= max(p.X, r.X) && q.X >= min(p.X, r.X) && q.Y <= max(p.Y, r.Y) && q.Y >= min(p.Y, r.Y)
+}
 
-		if a.buf != nil || count == 0 {
-			// already allocated the expected number of nodes, but now another node
-			// was unexpectedly requested, allocate a small buffer
-			count = 1024
+// check if a polygon diagonal intersects any polygon segments
+func intersectsPolygon[T float](a, b *node[T]) bool {
+	// an edge whose bbox can't overlap the diagonal's bbox can't intersect it
+	minX, maxX := min(a.X, b.X), max(a.X, b.X)
+	minY, maxY := min(a.Y, b.Y), max(a.Y, b.Y)
+
+	p := a
+	for {
+		n := p.Next
+
+		outside := (p.X > maxX && n.X > maxX) || (p.X < minX && n.X < minX) ||
+			(p.Y > maxY && n.Y > maxY) || (p.Y < minY && n.Y < minY)
+
+		if !outside && p.Index != a.Index && n.Index != a.Index && p.Index != b.Index && n.Index != b.Index &&
+			intersects(p, n, a, b, true) {
+			return true
 		}
 
-		a.buf = make([]node[T], count)
+		p = n
+		if p == a {
+			return false
+		}
 	}
-
-	node := &a.buf[0]
-	a.buf = a.buf[1:]
-
-	return node
 }
 
-func createNode[T float, I uint32 | int](a *nodeAllocator[T], idx I, point Point[T]) *node[T] {
-	node := a.Alloc()
-
-	node.Point = point
-	node.Index = uint32(idx)
-
-	return node
-}
-
-func insertNode[T float, I uint32 | int](a *nodeAllocator[T], idx I, point Point[T], last *node[T]) *node[T] {
-	p := createNode(a, idx, point)
-	if last == nil {
-		p.Prev = p
-		p.Next = p
-	} else {
-		p.Next = last.Next
-		p.Prev = last
-		last.Next.Prev = p
-		last.Next = p
+// check if a polygon diagonal is locally inside the polygon
+func locallyInside[T float](a, b *node[T]) bool {
+	if area(a.Prev, a, a.Next) < 0 {
+		return area(a, b, a.Next) >= 0 && area(a, a.Prev, b) >= 0
 	}
 
-	return p
+	return area(a, b, a.Prev) < 0 || area(a, a.Next, b) < 0
 }
 
-func removeNode[T float](p *node[T]) {
-	p.Next.Prev = p.Prev
-	p.Prev.Next = p.Next
+// check if the middle point of a polygon diagonal is inside the polygon
+func middleInside[T float](a, b *node[T]) bool {
+	inside := false
 
-	if p.PrevZ != nil {
-		p.PrevZ.NextZ = p.NextZ
-	}
+	px := (a.X + b.X) / 2
+	py := (a.Y + b.Y) / 2
 
-	if p.NextZ != nil {
-		p.NextZ.PrevZ = p.PrevZ
+	p := a
+	for {
+		n := p.Next
+
+		// do not remove the extra T casts, they prevent go from emitting fma instructions
+		//goland:noinspection GoRedundantConversion
+		if ((p.Y > py) != (n.Y > py)) && (px < T((n.X-p.X)*(py-p.Y)/(n.Y-p.Y))+p.X) {
+			inside = !inside
+		}
+
+		p = n
+		if p == a {
+			return inside
+		}
 	}
 }
 
 // link two polygon vertices with a bridge; if the vertices belong to the same ring, it splits polygon into two;
 // if one belongs to the outer ring and another to a hole, it merges it into a single ring
-func splitPolygon[T float](alloc *nodeAllocator[T], a, b *node[T]) *node[T] {
-
-	a2 := createNode(alloc, a.Index, a.Point)
-	b2 := createNode(alloc, b.Index, b.Point)
+func (e *earcut[T]) splitPolygon(a, b *node[T]) *node[T] {
+	a2 := e.createNode(a.Index, a.Point)
+	b2 := e.createNode(b.Index, b.Point)
 
 	an := a.Next
 	bp := b.Prev
@@ -912,26 +933,103 @@ func splitPolygon[T float](alloc *nodeAllocator[T], a, b *node[T]) *node[T] {
 	return b2
 }
 
-func linkedList[T float](alloc *nodeAllocator[T], points []Point[T], clockwise bool, indexOffset uint32) *node[T] {
-	var last *node[T]
+// create a node and optionally link it with previous one (in a circular doubly linked list)
+func (e *earcut[T]) insertNode(idx uint32, point Point[T], last *node[T]) *node[T] {
+	p := e.createNode(idx, point)
 
-	isClockwise := signedArea(points) > 0
-
-	if isClockwise == clockwise {
-		for i, point := range points {
-			last = insertNode(alloc, uint32(i)+indexOffset, point, last)
-		}
+	if last == nil {
+		p.Prev = p
+		p.Next = p
 	} else {
-		for i := len(points) - 1; i >= 0; i-- {
-			last = insertNode(alloc, uint32(i)+indexOffset, points[i], last)
+		p.Next = last.Next
+		p.Prev = last
+		last.Next.Prev = p
+		last.Next = p
+	}
+
+	return p
+}
+
+func (e *earcut[T]) removeNode(p *node[T]) {
+	p.Next.Prev = p.Prev
+	p.Prev.Next = p.Next
+
+	if p.PrevZ != nil {
+		p.PrevZ.NextZ = p.NextZ
+	}
+
+	if p.NextZ != nil {
+		p.NextZ.PrevZ = p.PrevZ
+	}
+
+	// keep the bboxes of the hole bridge index covering the healed prev->next edge
+	if e.indexActive {
+		e.growBlock(p.Prev, p.Next)
+	}
+}
+
+func (e *earcut[T]) createNode(idx uint32, point Point[T]) *node[T] {
+	n := e.alloc.Alloc()
+	n.Point = point
+	n.Index = idx
+	return n
+}
+
+func signedArea[T float](points []Point[T]) float64 {
+	var sum float64
+
+	for i, j := 0, len(points)-1; i < len(points); j, i = i, i+1 {
+		pi, pj := points[i], points[j]
+
+		// do not remove the extra float64 casts, they prevent go from emitting fma instructions
+		//goland:noinspection GoRedundantConversion
+		sum += float64((float64(pj.X) - float64(pi.X)) * (float64(pi.Y) + float64(pj.Y)))
+	}
+
+	return sum
+}
+
+type node[T float] struct {
+	Point[T]
+	Prev, Next   *node[T]
+	PrevZ, NextZ *node[T]
+
+	// z-order curve value. During eliminateHoles it holds the index of the owning block.
+	Z       int32
+	Index   uint32
+	Steiner bool
+}
+
+func (n *node[T]) EqualTo(other *node[T]) bool {
+	return n.Point == other.Point
+}
+
+// alive reports whether the node is still linked into its ring
+func (n *node[T]) alive() bool {
+	return n.Prev.Next == n
+}
+
+// nodeAllocator hands out nodes from larger chunks to reduce the number of allocations.
+type nodeAllocator[T float] struct {
+	Expected int
+	buf      []node[T]
+}
+
+func (a *nodeAllocator[T]) Alloc() *node[T] {
+	if len(a.buf) == 0 {
+		count := a.Expected
+
+		if a.buf != nil || count == 0 {
+			// already allocated the expected number of nodes, but now another node
+			// was unexpectedly requested, allocate a small buffer
+			count = 1024
 		}
+
+		a.buf = make([]node[T], count)
 	}
 
-	// join the last polygon if closed
-	if last != nil && last.EqualTo(last.Next) {
-		removeNode(last)
-		last = last.Next
-	}
+	n := &a.buf[0]
+	a.buf = a.buf[1:]
 
-	return last
+	return n
 }
