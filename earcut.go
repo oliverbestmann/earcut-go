@@ -64,7 +64,8 @@ func Triangulate[T float](polygon []Point[T], holes [][]Point[T]) ([]Point[T], [
 		}
 	}
 
-	e.triangles = make([]uint32, 0, 3*len(points))
+	// every hole adds two bridge nodes, and so two triangles
+	e.triangles = make([]uint32, 0, 3*(len(points)+2*len(holes)))
 
 	e.earcutLinked(outer)
 	for len(e.splitStack) > 0 {
@@ -81,6 +82,11 @@ func concatRings[T float](polygon []Point[T], holes [][]Point[T]) []Point[T] {
 	count := len(polygon)
 	for _, hole := range holes {
 		count += len(hole)
+	}
+
+	if count == len(polygon) {
+		// no holes, no need to copy
+		return polygon
 	}
 
 	points := make([]Point[T], 0, count)
@@ -111,13 +117,20 @@ type earcut[T float] struct {
 	indexActive bool
 
 	// block index for findHoleBridge, see indexSegment
-	blockBBox []T // minX, minY, maxX, maxY per block
-	blockHead []*node[T]
-	blockStop []*node[T]
+	blocks []block[T]
 
 	// scratch buffers for sorting nodes by z-order
 	sortArr, sortBuf []*node[T]
 	zArr, zBuf       []uint32
+}
+
+// block is a run of up to blockSize consecutive ring edges in the hole bridge index
+type block[T float] struct {
+	// first node of the run, and the node just past it
+	head, stop *node[T]
+
+	// bbox of all edges in the run
+	minX, minY, maxX, maxY T
 }
 
 // create a circular doubly linked list from polygon points in the specified winding order
@@ -355,6 +368,10 @@ func (e *earcut[T]) splitEarcut(start *node[T]) {
 				a = e.filterPoints(a, a.Next)
 				c = e.filterPoints(c, c.Next)
 
+				if e.splitStack == nil {
+					e.splitStack = make([]*node[T], 0, 16)
+				}
+
 				// queue both halves, a on top so it's triangulated first
 				e.splitStack = append(e.splitStack, c, a)
 				return
@@ -464,10 +481,7 @@ func (e *earcut[T]) buildBlockIndex(maxNodes, numHoles int) {
 	// every input node indexed once, +2 bridge nodes per hole, plus a partial
 	// trailing block per appended segment
 	maxBlocks := (maxNodes+2*numHoles+blockSize-1)/blockSize + numHoles + 2
-
-	e.blockBBox = make([]T, 0, 4*maxBlocks)
-	e.blockHead = make([]*node[T], 0, maxBlocks)
-	e.blockStop = make([]*node[T], 0, maxBlocks)
+	e.blocks = make([]block[T], 0, maxBlocks)
 }
 
 // index the ring run head..stop (exclusive) as blocks of up to blockSize edges.
@@ -475,8 +489,8 @@ func (e *earcut[T]) buildBlockIndex(maxNodes, numHoles int) {
 func (e *earcut[T]) indexSegment(head, stop *node[T]) {
 	p := head
 	for {
-		block := int32(len(e.blockHead))
-		e.blockHead = append(e.blockHead, p)
+		idx := int32(len(e.blocks))
+		first := p
 
 		minX, minY, maxX, maxY := p.X, p.Y, p.X, p.Y
 
@@ -485,7 +499,7 @@ func (e *earcut[T]) indexSegment(head, stop *node[T]) {
 			c := p.Next
 
 			// reuse z as the owning block during eliminateHoles, see growBlock
-			p.Z = block
+			p.Z = idx
 
 			minX = min(minX, c.X)
 			minY = min(minY, c.Y)
@@ -500,8 +514,10 @@ func (e *earcut[T]) indexSegment(head, stop *node[T]) {
 			}
 		}
 
-		e.blockStop = append(e.blockStop, p)
-		e.blockBBox = append(e.blockBBox, minX, minY, maxX, maxY)
+		e.blocks = append(e.blocks, block[T]{
+			head: first, stop: p,
+			minX: minX, minY: minY, maxX: maxX, maxY: maxY,
+		})
 
 		if p == stop {
 			return
@@ -512,33 +528,29 @@ func (e *earcut[T]) indexSegment(head, stop *node[T]) {
 // when filterPoints heals an edge head->tail by removing the node between them, the new
 // edge can reach outside of the bbox of head's block. Grow the bbox to cover tail.
 func (e *earcut[T]) growBlock(head, tail *node[T]) {
-	bbox := e.blockBBox[head.Z*4:][:4]
-	bbox[0] = min(bbox[0], tail.X)
-	bbox[1] = min(bbox[1], tail.Y)
-	bbox[2] = max(bbox[2], tail.X)
-	bbox[3] = max(bbox[3], tail.Y)
+	b := &e.blocks[head.Z]
+	b.minX = min(b.minX, tail.X)
+	b.minY = min(b.minY, tail.Y)
+	b.maxX = max(b.maxX, tail.X)
+	b.maxY = max(b.maxY, tail.Y)
 }
 
-func (e *earcut[T]) liveBlockStop(b int) *node[T] {
-	stop := e.blockStop[b]
-	for !stop.alive() {
-		stop = stop.Next
+func (b *block[T]) liveStop() *node[T] {
+	for !b.stop.alive() {
+		b.stop = b.stop.Next
 	}
 
-	e.blockStop[b] = stop
-	return stop
+	return b.stop
 }
 
 // the head node of a block can be removed by filterPoints during merges. Advance it to
 // the next live node so the walk does not start on a removed node.
-func (e *earcut[T]) liveBlockHead(b int) *node[T] {
-	head := e.blockHead[b]
-	for !head.alive() {
-		head = head.Next
+func (b *block[T]) liveHead() *node[T] {
+	for !b.head.alive() {
+		b.head = b.head.Next
 	}
 
-	e.blockHead[b] = head
-	return head
+	return b.head
 }
 
 // David Eberly's algorithm for finding a bridge between hole and outer polygon
@@ -556,16 +568,15 @@ func (e *earcut[T]) findHoleBridge(hole, outer *node[T]) *node[T] {
 	}
 
 	// skip blocks whose bbox can't hold a crossing that beats qx and lies left of hx
-	bbox := e.blockBBox
-	for b := range e.blockHead {
-		g := 4 * b
-		if hy < bbox[g+1] || hy > bbox[g+3] || bbox[g] > hx || bbox[g+2] <= qx {
+	for i := range e.blocks {
+		b := &e.blocks[i]
+		if hy < b.minY || hy > b.maxY || b.minX > hx || b.maxX <= qx {
 			continue
 		}
 
-		stop := e.liveBlockStop(b)
+		stop := b.liveStop()
 
-		p := e.liveBlockHead(b)
+		p := b.liveHead()
 		for {
 			if hole.EqualTo(p.Next) {
 				return p.Next
@@ -612,15 +623,15 @@ func (e *earcut[T]) findHoleBridge(hole, outer *node[T]) *node[T] {
 	t2 := Point[T]{X: pick(hy < my, qx, hx), Y: hy}
 
 	// skip blocks whose bbox can't overlap the triangle's bbox
-	for b := range e.blockHead {
-		g := 4 * b
-		if bbox[g+2] < mx || bbox[g] > hx || bbox[g+3] < tminY || bbox[g+1] > tmaxY {
+	for i := range e.blocks {
+		b := &e.blocks[i]
+		if b.maxX < mx || b.minX > hx || b.maxY < tminY || b.minY > tmaxY {
 			continue
 		}
 
-		stop := e.liveBlockStop(b)
+		stop := b.liveStop()
 
-		p := e.liveBlockHead(b)
+		p := b.liveHead()
 		for {
 			if hx >= p.X && p.X >= mx && hx != p.X && pointInTriangle(t0, t1, t2, p.Point) {
 				// tangential
@@ -660,6 +671,14 @@ func sectorContainsSector[T float](m, p *node[T]) bool {
 
 // interlink polygon nodes in z-order: collect into a slice, sort by z, relink
 func (e *earcut[T]) indexCurve(start *node[T]) {
+	if e.sortArr == nil {
+		// the first ring is the largest one, it has at most the expected number of nodes
+		// one allocation for both sortArr and sortBuf
+		size := e.alloc.Expected
+		buf := make([]*node[T], 2*size)
+		e.sortArr, e.sortBuf = buf[:0:size], buf[size:]
+	}
+
 	nodes := e.sortArr[:0]
 
 	p := start
@@ -714,9 +733,15 @@ func (e *earcut[T]) sortNodes() {
 	}
 
 	if len(e.zArr) < n {
-		e.zArr = make([]uint32, n)
-		e.zBuf = make([]uint32, n)
-		e.sortBuf = make([]*node[T], n)
+		// size for the largest possible ring, so this only allocates once
+		size := max(n, cap(e.sortArr))
+
+		z := make([]uint32, 2*size)
+		e.zArr, e.zBuf = z[:size], z[size:]
+
+		if len(e.sortBuf) < size {
+			e.sortBuf = make([]*node[T], size)
+		}
 	}
 
 	zArr, zBuf, buf := e.zArr[:n], e.zBuf[:n], e.sortBuf[:n]
