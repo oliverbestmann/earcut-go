@@ -1,53 +1,69 @@
-# Earcut
+# earcut-go
 
-## About the port
+A Go port of the JavaScript polygon triangulation library [mapbox/earcut](https://github.com/mapbox/earcut).
+It splits a polygon, with optional holes, into triangles.
 
-This package is a straightforward Go port of the JavaScript library [mapbox/earcut](https://github.com/mapbox/earcut).
-It mirrors the original behaviour and aims to be a drop-in equivalent for polygon triangulation.
-
-The code is a manual port. Documentation and comments were AI-generated or refined.
-
-The API is intentionally small. There is one exported function, `Triangulate`, and one exported type, `Point[T]`, which is used to represent polygon vertices. `Triangulate` takes a slice of points forming the outer polygon and an optional list of hole polygons. It returns two values: the outer ring and all holes concatenated into one slice, and a flat slice of indices into that slice. Every consecutive group of three indices references one triangle in the output.
-
-Signature:
-
-```go
-func Triangulate[T float32 | float64](polygon []Point[T], holes [][]Point[T]) ([]Point[T], []uint32)
-```
-
-Use `Triangulate` with either `float32` or `float64` by specifying the type parameter explicitly.
-
-For algorithm details, edge cases, and general behaviour, refer to the original
-[README](https://github.com/mapbox/earcut/blob/c00ba4e1e724cab5e611d136eef9d3f43e2f3386/README.md).
+The port follows upstream commit
+[77019d3](https://github.com/mapbox/earcut/tree/77019d32d4fec70758ba13b52ce6692e9b4b1246) (after version 3.2.4).
+For the upstream fixtures and the upstream tile fixture with 119,680 polygons, it returns exactly the same triangles
+as the JavaScript version.
 
 ## Usage
 
 ```go
 import "github.com/oliverbestmann/earcut-go"
 
-// Define polygon vertices (using float64)
 polygon := []earcut.Point[float64]{
-    {X: 0, Y: 0},
-    {X: 10, Y: 0},
-    {X: 10, Y: 10},
-    {X: 0, Y: 10},
+	{X: 0, Y: 0},
+	{X: 10, Y: 0},
+	{X: 10, Y: 10},
+	{X: 0, Y: 10},
 }
 
 points, indices := earcut.Triangulate(polygon, nil)
-// indices[0], indices[1], indices[2] form the first triangle
-// indices[3], indices[4], indices[5] form the second triangle, etc.
+// points[indices[0]], points[indices[1]], points[indices[2]] form the first triangle,
+// points[indices[3]], points[indices[4]], points[indices[5]] the second one, and so on.
 ```
+
+`Triangulate` takes the outer ring and a list of holes. It works with `float32` and `float64` points. It returns the
+outer ring and the holes concatenated into one slice, and a flat slice of indices into that slice. Every three indices
+form one triangle. A hole with a single point is a Steiner point: it is not cut out, but becomes a vertex of the
+triangulation. The winding order of the input does not matter.
+
+`Deviation` compares the area of the polygon with the area of the triangles. A result near zero means the
+triangulation is correct.
+
+`Refine` flips edges of a triangulation in place until it is close to the constrained Delaunay triangulation (the
+triangulation that maximizes the smallest angle of all triangles). The output has fewer long, thin triangles. Use it if
+the triangles are used for things like shading or physics, where thin triangles cause problems.
+
+```go
+points, indices := earcut.Triangulate(polygon, holes)
+earcut.Refine(indices, points)
+```
+
+## Differences to upstream
+
+- The API takes rings of points instead of a flat coordinate array with hole indices, so there is no `flatten` and
+  no `dim` parameter.
+- Empty holes are ignored. Upstream skips them in `flatten`.
+- Upstream keeps scratch buffers in module level variables. This port allocates them for each call, so
+  `Triangulate` is safe to call from multiple goroutines.
 
 ## The algorithm
 
-The library implements a modified ear slicing algorithm,
-optimized by [z-order curve](https://en.wikipedia.org/wiki/Z-order_curve) hashing
-and extended to handle holes, twisted polygons, degeneracies and self-intersections
-in a way that doesn't _guarantee_ correctness of triangulation,
-but attempts to always produce acceptable results for practical data.
+The library uses ear slicing (repeatedly cutting off a triangle at a convex corner of the polygon). It uses a
+[z-order curve](https://en.wikipedia.org/wiki/Z-order_curve) index to find points near a candidate triangle quickly.
+It also handles holes, twisted polygons, degenerate input and self-intersections. It does not guarantee a correct
+triangulation for such input, but tries to produce an acceptable result for real-world data.
 
-It's based on ideas from
+It is based on ideas from
 [FIST: Fast Industrial-Strength Triangulation of Polygons](http://www.cosy.sbg.ac.at/~held/projects/triang/triang.html)
-by Martin Held
-and [Triangulation by Ear Clipping](http://www.geometrictools.com/Documentation/TriangulationByEarClipping.pdf) by David
-Eberly.
+by Martin Held and [Triangulation by Ear Clipping](http://www.geometrictools.com/Documentation/TriangulationByEarClipping.pdf)
+by David Eberly. See the [upstream README](https://github.com/mapbox/earcut/blob/77019d32d4fec70758ba13b52ce6692e9b4b1246/README.md)
+for more details.
+
+## Tests
+
+The tests use the fixtures and expected results from upstream, in `testdata`. `testdata/tiles-fixture.bin` holds
+119,680 polygons from Mapbox Vector Tiles. The test for it takes about a second, and `go test -short` skips it.
