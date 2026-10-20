@@ -23,12 +23,13 @@ type float interface {
 // The polygon parameter defines the outer boundary; each element of holes
 // defines an inner boundary (a hole) within the polygon.
 //
-// It returns the outer ring and all holes concatenated into one slice, and a
-// flat slice of indices into it. Without holes, the returned points are the polygon
-// slice itself, not a copy. Every three consecutive indices form one
-// triangle: indices[i], indices[i+1], indices[i+2]. A hole with a single point
-// is a Steiner point: it is not cut out, but used as a triangle vertex.
-// Empty holes are ignored.
+// It returns two slices. The first holds the outer ring followed by all holes. If
+// there are no holes, it is the polygon slice itself, not a copy. The second holds
+// indices into the first, and every three consecutive indices form one triangle:
+// indices[i], indices[i+1], indices[i+2].
+//
+// A hole with a single point is a Steiner point: Triangulate does not cut it out,
+// but uses it as a triangle vertex. Empty holes are ignored.
 func Triangulate[T float](polygon []Point[T], holes [][]Point[T]) ([]Point[T], []uint32) {
 	points := concatRings(polygon, holes)
 

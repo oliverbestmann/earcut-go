@@ -1,16 +1,16 @@
 package earcut
 
-// Refine improves a triangulation in place by flipping interior edges (Lawson flips)
-// until it is close to the constrained Delaunay triangulation. That maximizes the
-// minimum angle and removes most long, thin triangles. The polygon boundary and the
-// number of triangles stay the same.
+// Refine changes a triangulation in place. It flips the shared edge of two neighboring
+// triangles (a Lawson flip) until the result is close to the constrained Delaunay
+// triangulation, which has the largest possible smallest angle. Most long, thin
+// triangles disappear. The polygon boundary and the number of triangles stay the same.
 //
-// indices are the triangle indices returned by Triangulate, points are the points
-// they index into. It works on any manifold triangle mesh (every edge is shared by at
-// most two triangles).
+// indices are the triangle indices returned by Triangulate, and points are the points
+// they index into. Refine works on any manifold triangle mesh (a mesh where every edge
+// belongs to at most two triangles).
 //
-// The predicates are not exact. In the worst case an edge stays not quite Delaunay,
-// the mesh is never made invalid.
+// The geometric tests use plain floating point math. Because of rounding, an edge can
+// stay slightly off from Delaunay. The mesh itself stays valid.
 func Refine[T float](indices []uint32, points []Point[T]) {
 	t := indices
 	n := len(t) - len(t)%3
