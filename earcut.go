@@ -7,6 +7,7 @@ package earcut
 import (
 	"math"
 	"slices"
+	"sync"
 )
 
 // Point is a 2D point with X and Y coordinates.
@@ -33,9 +34,14 @@ type float interface {
 func Triangulate[T float](polygon []Point[T], holes [][]Point[T]) ([]Point[T], []uint32) {
 	points := concatRings(polygon, holes)
 
-	e := &earcut[T]{
-		alloc: nodeAllocator[T]{Expected: len(points) + 2*len(holes)},
+	e, _ := statePool.Get().(*earcut[T])
+	if e == nil {
+		// shortcut: one pool for all T, mixing float32 and float64 calls drops states. Fine unless both are hot.
+		e = &earcut[T]{}
 	}
+	defer statePool.Put(e)
+
+	e.reset(len(points) + 2*len(holes))
 
 	outer := e.linkedList(polygon, 0, true)
 	if outer == nil || outer.Next == outer.Prev {
@@ -78,6 +84,25 @@ func Triangulate[T float](polygon []Point[T], holes [][]Point[T]) ([]Point[T], [
 	}
 
 	return points, e.triangles
+}
+
+// statePool keeps earcut states, so the node and scratch buffers of one call are reused by the next.
+// Nodes never escape a call, so reusing them is safe.
+var statePool sync.Pool
+
+// reset prepares a pooled state for a new call, keeping the buffers.
+func (e *earcut[T]) reset(expectedNodes int) {
+	*e = earcut[T]{
+		alloc:      e.alloc,
+		splitStack: e.splitStack[:0],
+		blocks:     e.blocks[:0],
+		sortArr:    e.sortArr[:0],
+		sortBuf:    e.sortBuf,
+		zArr:       e.zArr,
+		zBuf:       e.zBuf,
+	}
+
+	e.alloc.reset(expectedNodes)
 }
 
 func concatRings[T float](polygon []Point[T], holes [][]Point[T]) []Point[T] {
@@ -483,7 +508,9 @@ func (e *earcut[T]) buildBlockIndex(maxNodes, numHoles int) {
 	// every input node indexed once, +2 bridge nodes per hole, plus a partial
 	// trailing block per appended segment
 	maxBlocks := (maxNodes+2*numHoles+blockSize-1)/blockSize + numHoles + 2
-	e.blocks = make([]block[T], 0, maxBlocks)
+	if cap(e.blocks) < maxBlocks {
+		e.blocks = make([]block[T], 0, maxBlocks)
+	}
 }
 
 // index the ring run head..stop (exclusive) as blocks of up to blockSize edges.
@@ -673,7 +700,7 @@ func sectorContainsSector[T float](m, p *node[T]) bool {
 
 // interlink polygon nodes in z-order: collect into a slice, sort by z, relink
 func (e *earcut[T]) indexCurve(start *node[T]) {
-	if e.sortArr == nil {
+	if cap(e.sortArr) < e.alloc.Expected {
 		// the first ring is the largest one, it has at most the expected number of nodes
 		// one allocation for both sortArr and sortBuf
 		size := e.alloc.Expected
@@ -997,8 +1024,7 @@ func (e *earcut[T]) removeNode(p *node[T]) {
 
 func (e *earcut[T]) createNode(idx uint32, point Point[T]) *node[T] {
 	n := e.alloc.Alloc()
-	n.Point = point
-	n.Index = idx
+	*n = node[T]{Point: point, Index: idx}
 	return n
 }
 
@@ -1036,23 +1062,39 @@ func (n *node[T]) alive() bool {
 	return n.Prev.Next == n
 }
 
-// nodeAllocator hands out nodes from larger chunks to reduce the number of allocations.
+// nodeAllocator hands out nodes from a buffer that is reused across calls.
+// Nodes it returns are not zeroed.
 type nodeAllocator[T float] struct {
 	Expected int
-	buf      []node[T]
+
+	// main holds room for the expected number of nodes, buf is what is left of it
+	main, buf []node[T]
+
+	// extra chunks for nodes beyond the expected number (splits add two each), used counts the ones in use
+	extra [][]node[T]
+	used  int
+}
+
+func (a *nodeAllocator[T]) reset(expected int) {
+	if cap(a.main) < expected {
+		a.main = make([]node[T], expected)
+	}
+
+	a.Expected = expected
+	a.buf = a.main[:expected]
+	a.used = 0
 }
 
 func (a *nodeAllocator[T]) Alloc() *node[T] {
 	if len(a.buf) == 0 {
-		count := a.Expected
-
-		if a.buf != nil || count == 0 {
-			// already allocated the expected number of nodes, but now another node
-			// was unexpectedly requested, allocate a small buffer
-			count = 1024
+		// more nodes than expected were requested, take a small extra chunk.
+		// Nodes are referenced by pointer, so main cannot grow in place.
+		if a.used == len(a.extra) {
+			a.extra = append(a.extra, make([]node[T], 1024))
 		}
 
-		a.buf = make([]node[T], count)
+		a.buf = a.extra[a.used]
+		a.used++
 	}
 
 	n := &a.buf[0]

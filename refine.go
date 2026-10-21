@@ -1,5 +1,7 @@
 package earcut
 
+import "sync"
+
 // Refine changes a triangulation in place. It flips the shared edge of two neighboring
 // triangles (a Lawson flip) until the result is close to the constrained Delaunay
 // triangulation, which has the largest possible smallest angle. Most long, thin
@@ -38,26 +40,46 @@ func Refine[T float](indices []uint32, points []Point[T]) {
 		}
 	}
 
+	// open addressing hash table from undirected edge to half-edge, load factor <= 0.25.
+	size := 1
+	for size < n*4 {
+		size <<= 1
+	}
+
+	scratch, _ := refinePool.Get().(*refineScratch)
+	if scratch == nil {
+		scratch = &refineScratch{}
+	}
+	defer refinePool.Put(scratch)
+
+	if cap(scratch.ints) < 2*n+size {
+		scratch.ints = make([]int32, 2*n+size)
+	}
+
+	if cap(scratch.stamps) < n {
+		scratch.stamps = make([]bool, n)
+	}
+
+	ints := scratch.ints[:2*n+size]
+
 	// twin half-edge of each edge, or -1 on the polygon boundary
-	he := make([]int32, n)
+	he := ints[:n]
 	for i := range he {
 		he[i] = -1
 	}
 
 	// interior edges still to check, and whether an edge is currently in the stack.
 	// edgeStamp keeps at most one entry per half-edge on the stack, so n is enough.
-	edgeStack := make([]int32, n)
-	edgeStamp := make([]bool, n)
+	edgeStack := ints[n : 2*n]
+	edgeStamp := scratch.stamps[:n]
+	clear(edgeStamp)
 
-	// open addressing hash table from undirected edge to half-edge, load factor <= 0.25.
-	// A slot value of -1 marks a pair that was already linked.
-	size := 1
-	for size < n*4 {
-		size <<= 1
+	// a slot value of -2 is empty, -1 marks a pair that was already linked
+	hTable := ints[2*n:]
+	for i := range hTable {
+		hTable[i] = -2
 	}
 
-	hTable := make([]int32, size)
-	hUsed := make([]bool, size)
 	hMask := uint32(size - 1)
 
 	// link the half-edge twins. Each linked pair seeds the stack with one of its edges.
@@ -67,7 +89,7 @@ func Refine[T float](indices []uint32, points []Point[T]) {
 		lo, hi := min(a, b), max(a, b)
 
 		h := (lo*0x9e3779b1 ^ hi*0x85ebca6b) & hMask
-		for hUsed[h] {
+		for hTable[h] != -2 {
 			if s := hTable[h]; s != -1 {
 				sa, sb := t[s], t[nextHalfEdge(int(s))]
 				if (sa == lo && sb == hi) || (sa == hi && sb == lo) {
@@ -87,10 +109,9 @@ func Refine[T float](indices []uint32, points []Point[T]) {
 			h = (h + 1) & hMask
 		}
 
-		if !hUsed[h] {
+		if hTable[h] == -2 {
 			// first occurrence: insert
 			hTable[h] = int32(e)
-			hUsed[h] = true
 		}
 	}
 
@@ -161,6 +182,14 @@ func Refine[T float](indices []uint32, points []Point[T]) {
 			push(br)
 		}
 	}
+}
+
+// refinePool keeps the scratch buffers of Refine for reuse by the next call
+var refinePool sync.Pool
+
+type refineScratch struct {
+	ints   []int32
+	stamps []bool
 }
 
 // next half-edge within the same triangle

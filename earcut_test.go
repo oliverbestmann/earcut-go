@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"sync"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -91,6 +93,35 @@ func BenchmarkTiles(b *testing.B) {
 	}
 }
 
+// BenchmarkTilesRefine measures Refine alone, like upstream's bench-refine.js:
+// earcut output is computed once and restored untimed before each pass.
+func BenchmarkTilesRefine(b *testing.B) {
+	polygons := readTilesFixture(b)
+
+	points := make([][]Point[float64], len(polygons))
+	base := make([][]uint32, len(polygons))
+	work := make([][]uint32, len(polygons))
+
+	for i, p := range polygons {
+		points[i], base[i] = Triangulate(p.outer, p.holes)
+		work[i] = make([]uint32, len(base[i]))
+	}
+
+	b.ReportAllocs()
+
+	for b.Loop() {
+		b.StopTimer()
+		for i := range base {
+			copy(work[i], base[i])
+		}
+		b.StartTimer()
+
+		for i := range work {
+			Refine(work[i], points[i])
+		}
+	}
+}
+
 func TestFixtures(t *testing.T) {
 	expected := loadExpectations(t)
 
@@ -116,6 +147,43 @@ func TestFixtures(t *testing.T) {
 			})
 		}
 	}
+}
+
+// Triangulate and Refine reuse pooled buffers, concurrent calls must not share them.
+func TestConcurrent(t *testing.T) {
+	names := []string{"water-huge", "building", "hole-touching-outer", "steiner", "dude"}
+
+	want := map[string][]uint32{}
+	for _, name := range names {
+		points, indices := Triangulate(toPolygon(loadFixture(t, name)))
+		Refine(indices, points)
+		want[name] = indices
+	}
+
+	square32 := []Point[float32]{{0, 0}, {1, 0}, {1, 1}, {0, 1}}
+	_, wantSquare := Triangulate(square32, nil)
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			for range 10 {
+				for _, name := range names {
+					points, indices := Triangulate(toPolygon(loadFixture(t, name)))
+					Refine(indices, points)
+					assert.Equal(t, want[name], indices, name)
+
+					// float32 calls get their own pooled state
+					_, square := Triangulate(square32, nil)
+					assert.Equal(t, wantSquare, square)
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
 }
 
 func TestIndices(t *testing.T) {
