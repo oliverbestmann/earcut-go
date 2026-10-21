@@ -3,10 +3,8 @@
 earcut-go splits a polygon, with optional holes, into triangles. It is a Go port of the JavaScript library
 [mapbox/earcut](https://github.com/mapbox/earcut).
 
-The port follows upstream commit
-[77019d3](https://github.com/mapbox/earcut/tree/77019d32d4fec70758ba13b52ce6692e9b4b1246) from 2026-10-18, which
-is newer than release 3.2.4. On arm64, it returns the same triangles as the JavaScript version for all upstream test
-polygons and for the 119,680 polygons in the upstream tile fixture. Other architectures were not compared.
+The port is based on upstream commit
+[77019d3](https://github.com/mapbox/earcut/tree/77019d32d4fec70758ba13b52ce6692e9b4b1246).
 
 ## Usage
 
@@ -49,9 +47,8 @@ earcut.Refine(indices, points)
 
 - The API takes rings of points instead of a flat coordinate array with hole indices. There is no `flatten`
   function and no `dim` parameter.
-- `Triangulate` ignores empty holes. Upstream skips them in `flatten`.
-- Upstream keeps scratch buffers in module level variables. This port creates them for each call, so you can call
-  `Triangulate` from multiple goroutines at the same time.
+- `Triangulate` ignores empty holes.
+- `Triangulate` is safe to call from multiple goroutines at the same time.
 
 ## The algorithm
 
@@ -70,6 +67,4 @@ has more details.
 
 ## Tests
 
-The tests use the polygons and expected results from upstream, stored in `testdata`. `testdata/tiles-fixture.bin` holds
-119,680 polygons from Mapbox Vector Tiles (the binary map tile format Mapbox uses). The test for this file takes about
-a second, and `go test -short` skips it.
+The tests use the test polygons and expected results from upstream. `go test -short` skips the slowest test.
